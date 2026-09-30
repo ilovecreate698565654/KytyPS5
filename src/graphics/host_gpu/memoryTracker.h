@@ -86,6 +86,11 @@ public:
 		});
 	}
 
+	// Creates the tracker regions over a range; a new region starts CPU-dirty.
+	void TrackRange(uint64_t vaddr, uint64_t size) {
+		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
+	}
+
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {

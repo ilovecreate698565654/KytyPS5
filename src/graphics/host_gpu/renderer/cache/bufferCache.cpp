@@ -74,6 +74,9 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
+		// PrepareBda only visits existing tracker regions, so a new buffer's region must exist
+		// (CPU-dirty) before the epoch bump makes it look synchronized.
+		m_memory_tracker.TrackRange(buffer.CpuAddress(), buffer.Size());
 		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
