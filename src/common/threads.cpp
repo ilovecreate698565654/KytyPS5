@@ -24,6 +24,8 @@
 
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
+#include <timeapi.h> // IWYU pragma: keep
+#pragma comment(lib, "winmm.lib")
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
@@ -153,6 +155,8 @@ struct CondVarPrivate {
 	~CondVarPrivate() = default;
 	KYTY_CLASS_NO_COPY(CondVarPrivate);
 	CONDITION_VARIABLE m_cv {};
+	// Bumped by every Signal/SignalAll so sub-millisecond waits can poll for a wakeup.
+	std::atomic<uint32_t> m_generation {0};
 #else
 	std::condition_variable_any m_cv;
 #endif
@@ -185,6 +189,17 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+#ifdef KYTY_WIN_CS
+	// Millisecond waits depended on SDL raising the timer resolution, and Windows 11 drops it
+	// (back to 15.6 ms) for occluded or minimized windows unless the process opts out.
+	timeBeginPeriod(1);
+	PROCESS_POWER_THROTTLING_STATE throttling {};
+	throttling.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+	throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4u; // IGNORE_TIMER_RESOLUTION
+	throttling.StateMask   = 0;
+	(void)SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling,
+	                            sizeof(throttling));
+#endif
 }
 
 Thread::Thread(thread_func_t func, void* arg)
@@ -344,10 +359,38 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
 #ifdef KYTY_WIN_CS
+	if (micros < 1000) {
+		// SleepConditionVariableCS only takes milliseconds, so a 100 us guest poll (equeue waits,
+		// the GPU thread's idle recheck) slept 1-2 ms: 10-20x the request. Yield until signaled
+		// or the deadline passes; every caller re-checks its condition after the wait returns.
+		const auto    generation = m_cond_var->m_generation.load(std::memory_order_acquire);
+		LARGE_INTEGER frequency {};
+		LARGE_INTEGER start {};
+		LARGE_INTEGER now {};
+		QueryPerformanceFrequency(&frequency);
+		QueryPerformanceCounter(&start);
+		const auto ticks = static_cast<LONGLONG>(micros) * frequency.QuadPart / 1000000;
+		LeaveCriticalSection(&mutex->m_mutex->m_cs);
+		bool signaled = false;
+		for (;;) {
+			if (m_cond_var->m_generation.load(std::memory_order_acquire) != generation) {
+				signaled = true;
+				break;
+			}
+			QueryPerformanceCounter(&now);
+			if (now.QuadPart - start.QuadPart >= ticks) {
+				break;
+			}
+			if (SwitchToThread() == 0) {
+				YieldProcessor();
+			}
+		}
+		EnterCriticalSection(&mutex->m_mutex->m_cs);
+		return signaled;
+	}
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, (micros < 1000 ? 1 : micros / 1000)) ==
-	           0 &&
+	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, micros / 1000) == 0 &&
 	       GetLastError() == ERROR_TIMEOUT);
 #else
 	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==
@@ -361,6 +404,7 @@ void CondVar::Signal() {
 #ifdef KYTY_WIN_CS
 	static auto func = ResolveWakeConditionVariable();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	m_cond_var->m_generation.fetch_add(1, std::memory_order_release);
 	func(&m_cond_var->m_cv);
 #else
 	m_cond_var->m_cv.notify_one();
@@ -371,6 +415,7 @@ void CondVar::SignalAll() {
 #ifdef KYTY_WIN_CS
 	static auto func = ResolveWakeAllConditionVariable();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
+	m_cond_var->m_generation.fetch_add(1, std::memory_order_release);
 	func(&m_cond_var->m_cv);
 #else
 	m_cond_var->m_cv.notify_all();
@@ -380,6 +425,12 @@ void CondVar::SignalAll() {
 int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
+}
+
+void Thread::RaiseCurrentPriority() {
+#ifdef KYTY_WIN_CS
+	(void)SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
 }
 
 } // namespace Common

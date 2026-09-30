@@ -43,6 +43,9 @@ public:
 	// The id is unique and can't be reused by another thread.
 	static int GetThreadIdUnique();
 
+	// Raise the calling thread above normal priority (the GPU command thread feeds every frame).
+	static void RaiseCurrentPriority();
+
 	KYTY_CLASS_NO_COPY(Thread);
 
 private:
