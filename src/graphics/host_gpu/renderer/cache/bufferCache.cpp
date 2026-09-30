@@ -358,11 +358,43 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+		// Windows the guest read recently tend to be read again every frame (Wolverine: ~200
+		// drains per frame, one window each). A drain paid here also downloads the recent windows
+		// the GPU has dirtied since, so their next reads don't each pay a drain of their own.
+		const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		std::erase_if(m_hot_windows, [&](const HotWindow& window) {
+			return window.frame + 2u < frame || window.begin == window_begin;
+		});
+		if (m_hot_windows.size() < MaxHotWindows) {
+			m_hot_windows.push_back({window_begin, window_end, frame});
+		}
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			constexpr uint64_t ExtraBudget = 8 * 1024 * 1024;
+			uint64_t           budget      = ExtraBudget;
+			std::vector<std::pair<uint64_t, uint64_t>> extra;
+			for (const auto& window: m_hot_windows) {
+				const auto bytes = window.end - window.begin;
+				if (window.begin == window_begin || bytes > budget) {
+					continue;
+				}
+				const auto* owner = m_page_table.Find(window.begin >> PageTable::kPageBits);
+				if (owner == nullptr || !*owner ||
+				    !m_slot_buffers[*owner].IsInBounds(window.begin, bytes) ||
+				    !m_memory_tracker.IsRegionGpuModified(window.begin, bytes)) {
+					continue;
+				}
+				if (DownloadBufferMemory(m_slot_buffers[*owner], window.begin, bytes)) {
+					extra.emplace_back(window.begin, bytes);
+					budget -= bytes;
+				}
+			}
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			for (const auto& [begin, bytes]: extra) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

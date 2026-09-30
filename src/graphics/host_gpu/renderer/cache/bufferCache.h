@@ -152,6 +152,14 @@ private:
 	                                        uint64_t total_size);
 
 	GraphicContext&                                    m_graphics;
+	// Guest-read windows of the last frames, downloaded together when one read drains (GPU thread).
+	struct HotWindow {
+		uint64_t begin;
+		uint64_t end;
+		uint64_t frame;
+	};
+	static constexpr size_t                            MaxHotWindows = 64;
+	std::vector<HotWindow>                             m_hot_windows;
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;
