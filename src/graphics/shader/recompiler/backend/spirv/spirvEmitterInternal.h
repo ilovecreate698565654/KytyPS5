@@ -430,7 +430,10 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 
 // Write reports: marks the 4 KiB page of element `index` (a dword index from the start of the
 // bound range) as written. A no-op for resources without a report.
-void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, uint32_t index);
+// changed: a bool id; when nonzero the page is reported only if it is true (the store changes
+// the stored bits). 0 reports unconditionally (atomics).
+void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                     uint32_t changed = 0);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,

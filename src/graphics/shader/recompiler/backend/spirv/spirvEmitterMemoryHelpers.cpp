@@ -82,16 +82,25 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 }
 
-void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
+void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, uint32_t index,
+                     uint32_t changed) {
 	if (access.write_report == 0) {
 		return;
 	}
 	state.write_report_sites++;
 	// The host passes WriteReportOff for a binding it doesn't track (read-only, small, or no ring
 	// space); it then treats the whole binding as written, as without reports.
-	const auto enabled = state.builder.AllocateId();
+	auto enabled = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), enabled, access.write_report,
 	                          ConstantU32(state, IR::WriteReportOff));
+	if (changed != 0) {
+		// A store of the bits already there leaves the page as it was: guest engines rewrite
+		// identical data every frame (Wolverine: ~99% of downloaded bytes unchanged). The first
+		// store that changes a word always loaded the original bits, so it is never missed.
+		const auto both = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, enabled, changed);
+		enabled = both;
+	}
 	EmitIfCondition(state, enabled, [&]() {
 		constexpr uint32_t PhaseMask = (1u << IR::WriteReportPhaseBits) - 1u;
 		const auto base  = EmitBinaryU32(state, spv::OpShiftRightLogical, access.write_report,

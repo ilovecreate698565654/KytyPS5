@@ -463,7 +463,6 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
-	EmitWriteReport(ctx.state, resource, index);
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
 	                            Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
@@ -475,6 +474,18 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	                            Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), data,
 	                                   ConstantU32(ctx.state, bits == 8u ? 0xffu : 0xffffu)),
 	                            shift);
+	if (resource.write_report != 0) {
+		const auto current = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), current, pointer,
+		                              resource.memory_access);
+		const auto changed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    spv::OpINotEqual, TypeBool(ctx.state), changed,
+		    Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), current, mask), value);
+		EmitWriteReport(ctx.state, resource, index, changed);
+	} else {
+		EmitWriteReport(ctx.state, resource, index);
+	}
 	const auto merge   = [&](uint32_t old) {
 		return Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state),
 		              Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), old,
@@ -510,10 +521,19 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	EmitWriteReport(ctx.state, resource, index);
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+	if (resource.write_report != 0) {
+		const auto current = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), current, pointer,
+		                              resource.memory_access);
+		const auto changed = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpINotEqual, TypeBool(ctx.state), changed, current,
+		                              data);
+		EmitWriteReport(ctx.state, resource, index, changed);
+	} else {
+		EmitWriteReport(ctx.state, resource, index);
+	}
+	ctx.state.builder.AddFunction(spv::OpStore, pointer, data, resource.memory_access);
 }
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
