@@ -235,6 +235,9 @@ private:
 	};
 	static constexpr size_t                            MaxHotWindows = 64;
 	std::vector<HotWindow>                             m_hot_windows;
+	// Research (KYTY_READBACK_STATS, GPU thread): tick of each buffer's last GPU write, keyed by
+	// BufferId index and generation, to measure how often a drain's data was already submitted.
+	std::unordered_map<uint64_t, uint64_t>             m_last_write_tick;
 	// Adaptive windows by window_begin; download completions update them off the GPU thread.
 	std::mutex                                         m_adaptive_mutex;
 	std::unordered_map<uint64_t, AdaptiveWindow>       m_adaptive_windows;

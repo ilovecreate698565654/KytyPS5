@@ -466,6 +466,12 @@ struct ReadbackStats {
 	uint64_t                                adaptive_trusted  = 0; // faults served without a drain
 	uint64_t                                adaptive_verified = 0; // forced verified downloads
 	uint64_t                                adaptive_pages    = 0; // pages unprotected on trust
+	// Drains by where the buffer's last GPU write was: in the recording, submitted and running,
+	// submitted and complete, or not seen (the buffer was created or joined since).
+	uint64_t                                write_recording   = 0;
+	uint64_t                                write_in_flight   = 0;
+	uint64_t                                write_complete    = 0;
+	uint64_t                                write_unknown     = 0;
 	std::unordered_map<uint64_t, uint32_t>  windows;
 	std::chrono::steady_clock::time_point   since        = std::chrono::steady_clock::now();
 	uint32_t                                reports      = 0;
@@ -493,6 +499,11 @@ struct ReadbackStats {
 		                    downloaded != 0 ? changed * 100u / downloaded : 0u);
 		if (prefetched != 0) {
 			text += fmt::format("  prefetched windows: {}\n", prefetched);
+		}
+		if (write_recording + write_in_flight + write_complete + write_unknown != 0) {
+			text += fmt::format("  drained buffer's last GPU write: {} recording, {} in flight, "
+			                    "{} complete, {} unknown\n",
+			                    write_recording, write_in_flight, write_complete, write_unknown);
 		}
 		const auto revoked = g_adaptive_revoked.exchange(0, std::memory_order_relaxed);
 		if (adaptive_trusted + adaptive_verified + revoked != 0) {
@@ -897,7 +908,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		const auto buffer_id = FindBuffer(vaddr, size);
+		auto&      buffer    = m_slot_buffers[buffer_id];
 
 		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
 		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
@@ -974,6 +986,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
 			return;
+		}
+		if (stats != nullptr) {
+			// Would a host-visible copy of the buffer let this drain skip the flush and the wait?
+			// Only when its last GPU write is in an earlier submission, ideally one that is done.
+			const auto found =
+			    m_last_write_tick.find((uint64_t {buffer_id.index} << 32u) | buffer_id.generation);
+			if (found == m_last_write_tick.end()) {
+				stats->write_unknown++;
+			} else if (found->second >= m_scheduler.CurrentTick()) {
+				stats->write_recording++;
+			} else if (m_scheduler.IsFree(found->second)) {
+				stats->write_complete++;
+			} else {
+				stats->write_in_flight++;
+			}
 		}
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
@@ -1304,6 +1331,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (WriteReportsEnabled() && !reported) {
 			m_gpu_written_ranges.Add(vaddr, size);
 		}
+	}
+	if (is_written && ReadbackStats::Enabled()) {
+		if (m_last_write_tick.size() >= 4096) {
+			m_last_write_tick.clear(); // ids of deleted buffers pile up
+		}
+		m_last_write_tick[(uint64_t {id.index} << 32u) | id.generation] = m_scheduler.CurrentTick();
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
