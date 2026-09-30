@@ -856,7 +856,12 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	heap.slots[key]         = slot;
 	image->bindless_pinned  = true;
 	image->usage.texture    = true;
-	heap.resolved.push_back(binding.image_id);
+	// Every draw copies and walks the resolved list; an image shared by several keys only needs
+	// its layout checked once (unregistering erases every copy either way).
+	if (std::find(heap.resolved.begin(), heap.resolved.end(), binding.image_id) ==
+	    heap.resolved.end()) {
+		heap.resolved.push_back(binding.image_id);
+	}
 	table.AddImageReference(binding.image_id, heap, key);
 	table.SetTranslation(heap, key, slot);
 	return true;
