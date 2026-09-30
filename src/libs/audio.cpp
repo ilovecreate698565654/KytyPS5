@@ -389,7 +389,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 			Common::Thread::SleepMicro(1000);
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
-		if (port->queue_primed) {
+		// Hold to the buffer period only while the cushion is healthy. Each period overshoots by
+		// timer latency, conversion and the other ports' work, so pacing unconditionally drained
+		// the queue to one grain and SDL filled the gap with silence (crackle, worse under load).
+		if (port->queue_primed && queued >= static_cast<int>(min_queued_size / 2)) {
 			const auto next_time = port->last_output_time + buffer_us;
 			const auto now       = LibKernel::KernelGetProcessTime();
 			if (next_time > now) {
