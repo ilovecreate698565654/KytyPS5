@@ -129,7 +129,10 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	// Stream memory is read back too: the write-report ring lives there so shader atomics stay
+	// in video memory.
+	EXIT_IF((m_usage != MemoryUsage::Download && m_usage != MemoryUsage::Stream) ||
+	        offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
