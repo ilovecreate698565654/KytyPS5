@@ -37,6 +37,8 @@ void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 void RenderContext::ShutdownGpu() {
 	if (m_gpu != nullptr) {
 		m_gpu->Shutdown();
+		// Label completions on the priority thread still reference the GuestGpu.
+		m_command_scheduler.DrainPriorityOperations();
 		m_gpu.reset();
 	}
 	if (m_video_out != nullptr) {
