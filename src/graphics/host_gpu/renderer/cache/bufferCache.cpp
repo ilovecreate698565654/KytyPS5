@@ -13,13 +13,17 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -323,6 +327,57 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	return true;
 }
 
+namespace {
+
+// Research: KYTY_READBACK_STATS=1 prints, every 2 s, how guest readbacks drain the GPU: how many,
+// how many distinct windows, writes vs reads, how many windows were already downloaded as part of
+// an earlier drain's batch, and the most frequent windows. GPU thread only.
+struct ReadbackStats {
+	uint64_t                                calls        = 0;
+	uint64_t                                writes       = 0;
+	uint64_t                                fast_path    = 0;
+	uint64_t                                drains       = 0;
+	uint64_t                                was_hot      = 0;
+	uint64_t                                extras       = 0;
+	uint64_t                                extra_bytes  = 0;
+	std::unordered_map<uint64_t, uint32_t>  windows;
+	std::chrono::steady_clock::time_point   since        = std::chrono::steady_clock::now();
+	uint32_t                                reports      = 0;
+
+	static bool Enabled() {
+		static const bool enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		return enabled;
+	}
+	void Report() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - since < std::chrono::seconds(2) || reports >= 30) {
+			return;
+		}
+		std::vector<std::pair<uint64_t, uint32_t>> top(windows.begin(), windows.end());
+		std::sort(top.begin(), top.end(),
+		          [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::string text = fmt::format(
+		    "Readback stats (2 s): calls={} writes={} fast={} drains={} distinct_windows={} "
+		    "already_batched={} extra_downloads={} ({} KiB)\n",
+		    calls, writes, fast_path, drains, windows.size(), was_hot, extras, extra_bytes / 1024u);
+		for (size_t i = 0; i < std::min<size_t>(top.size(), 8u); i++) {
+			text += fmt::format("  window 0x{:012x} x{}\n", top[i].first, top[i].second);
+		}
+		Log::WriteToConsoleAndLog(text);
+		const auto reported = reports;
+		*this   = {};
+		since   = now;
+		reports = reported + 1u;
+	}
+};
+
+ReadbackStats& GetReadbackStats() {
+	static ReadbackStats stats;
+	return stats;
+}
+
+} // namespace
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -331,6 +386,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory");
+		auto*      stats = ReadbackStats::Enabled() ? &GetReadbackStats() : nullptr;
+		if (stats != nullptr) {
+			stats->calls++;
+			stats->writes += is_write ? 1u : 0u;
+			stats->Report();
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -349,6 +410,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			}
+			if (stats != nullptr) {
+				stats->fast_path++;
+			}
 			return;
 		}
 
@@ -363,6 +427,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// drains per frame, one window each). A drain paid here also downloads the recent windows
 		// the GPU has dirtied since, so their next reads don't each pay a drain of their own.
 		const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		if (stats != nullptr) {
+			stats->drains++;
+			stats->windows[window_begin]++;
+			stats->was_hot += std::any_of(m_hot_windows.begin(), m_hot_windows.end(),
+			                              [&](const HotWindow& w) { return w.begin == window_begin; })
+			                      ? 1u
+			                      : 0u;
+		}
 		std::erase_if(m_hot_windows, [&](const HotWindow& window) {
 			return window.frame + 2u < frame || window.begin == window_begin;
 		});
@@ -388,6 +460,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				if (DownloadBufferMemory(m_slot_buffers[*owner], window.begin, bytes)) {
 					extra.emplace_back(window.begin, bytes);
 					budget -= bytes;
+					if (stats != nullptr) {
+						stats->extras++;
+						stats->extra_bytes += bytes;
+					}
 				}
 			}
 			const auto tick = m_scheduler.CurrentTick();
