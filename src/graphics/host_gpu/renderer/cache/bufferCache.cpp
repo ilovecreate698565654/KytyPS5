@@ -177,6 +177,34 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+namespace {
+
+// Research (KYTY_READBACK_STATS): of the GPU-dirty bytes downloaded, how many differ from what
+// guest memory already held. Mostly unchanged means the dirty marking is too coarse (bindings
+// marked written that the shaders never touched); mostly changed means genuine readbacks.
+std::atomic<uint64_t> g_downloaded_bytes {0};
+std::atomic<uint64_t> g_changed_bytes {0};
+
+bool DownloadDiffEnabled() {
+	static const bool enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+	return enabled;
+}
+
+void CountChangedBytes(uint64_t vaddr, const uint8_t* data, uint64_t size) {
+	std::vector<uint8_t> current(size);
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, current.data(), size)) {
+		return;
+	}
+	uint64_t changed = 0;
+	for (uint64_t i = 0; i < size; i++) {
+		changed += current[i] != data[i] ? 1u : 0u;
+	}
+	g_downloaded_bytes.fetch_add(size, std::memory_order_relaxed);
+	g_changed_bytes.fetch_add(changed, std::memory_order_relaxed);
+}
+
+} // namespace
+
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size) {
 	const auto buffer_address = buffer.CpuAddress();
@@ -225,6 +253,10 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	                                    copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
+			if (DownloadDiffEnabled()) {
+				CountChangedBytes(buffer_address + copy.srcOffset,
+				                  mapped + (copy.dstOffset - offset), copy.size);
+			}
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
@@ -361,6 +393,11 @@ struct ReadbackStats {
 		    "Readback stats (2 s): calls={} writes={} merged_stores={} fast={} drains={} "
 		    "distinct_windows={} already_batched={} extra_downloads={} ({} KiB)\n",
 		    calls, writes, stores, fast_path, drains, windows.size(), was_hot, extras, extra_bytes / 1024u);
+		const auto downloaded = g_downloaded_bytes.exchange(0, std::memory_order_relaxed);
+		const auto changed    = g_changed_bytes.exchange(0, std::memory_order_relaxed);
+		text += fmt::format("  downloaded {} KiB of GPU-dirty bytes, {} KiB changed ({}%)\n",
+		                    downloaded / 1024u, changed / 1024u,
+		                    downloaded != 0 ? changed * 100u / downloaded : 0u);
 		for (size_t i = 0; i < std::min<size_t>(top.size(), 8u); i++) {
 			text += fmt::format("  window 0x{:012x} x{}\n", top[i].first, top[i].second);
 		}
