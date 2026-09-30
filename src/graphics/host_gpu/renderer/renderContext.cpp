@@ -26,6 +26,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	// m_bindless_table is destroyed before m_texture_cache, whose destructor unregisters every
+	// image; a pinned one would call back into the destroyed table.
+	m_texture_cache.on_bindless_unregister = nullptr;
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
