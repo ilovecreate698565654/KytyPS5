@@ -125,6 +125,9 @@ public:
 		}
 	}
 
+	// Only an active recovery snapshot touches the buffer cache before the first attempt.
+	[[nodiscard]] bool Active() const { return m_enabled; }
+
 	bool Retry() {
 		if (!m_enabled) return false;
 		auto&      cache  = m_context.GetBufferCache();
@@ -537,9 +540,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	RebindBuffers(bindings);
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
+	bool first_attempt = true;
 	do {
-		RebindImages(bindings);
-		RebindBuffers(bindings);
+		// The bindings above stay current unless the recovery snapshot synchronized buffers or
+		// a retry paged memory in; rebinding them again costs two uploads per dispatch.
+		if (!first_attempt || recovery.Active()) {
+			RebindImages(bindings);
+			RebindBuffers(bindings);
+		}
+		first_attempt = false;
 		auto              vk_buffer        = buffer.Handle();
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
