@@ -210,14 +210,23 @@ void CommandScheduler::Wait(uint64_t tick) {
 
 void CommandScheduler::PopPendingOperations() {
 	KYTY_PROFILER_FUNCTION();
+	uint64_t front_tick = 0;
 	{
 		// Runs per draw and dispatch: skip the driver's semaphore query when nothing waits.
 		std::lock_guard lock(m_operation_mutex);
 		if (m_pending_operations.empty()) {
 			return;
 		}
+		front_tick = m_pending_operations.front().tick;
 	}
-	m_master.Refresh();
+	// Operations deferred into the command buffer still being recorded can't have completed,
+	// and a tick already known complete needs no query either (the counter only increases).
+	if (front_tick >= m_master.CurrentTick()) {
+		return;
+	}
+	if (!m_master.IsFree(front_tick)) {
+		m_master.Refresh();
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
