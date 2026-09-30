@@ -192,10 +192,9 @@ public:
 private:
 	static constexpr size_t MaxPooledSnapshots = 32;
 
-	// GPU thread only.
-	static std::vector<std::unique_ptr<Buffer>>& SnapshotPool() {
-		static std::vector<std::unique_ptr<Buffer>> pool;
-		return pool;
+	// GPU thread only. Owned by the RenderExecutor so the buffers are freed before the device.
+	[[nodiscard]] std::vector<std::unique_ptr<Buffer>>& SnapshotPool() const {
+		return m_context.GetRenderExecutor().RecoverySnapshotPool();
 	}
 
 	void Save(const Buffer& source, uint64_t offset, uint64_t address, uint64_t size, bool gds) {
