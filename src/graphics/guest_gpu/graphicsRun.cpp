@@ -363,6 +363,8 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	m_num_instances                    = 1;
+	m_predicate_skip                   = false;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -575,7 +577,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
 	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
 	EXIT_NOT_IMPLEMENTED(block_engine > 1);
-	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	if (dst_address_or_offset == 0x3022cu) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {
@@ -639,6 +641,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::Thread::RaiseCurrentPriority();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
@@ -1059,7 +1062,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			if (wait_op != 0) {
 				SynchronizePredicate(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
 			}
-			value = *reinterpret_cast<const volatile uint64_t*>(address);
+			value = ReadLabel(reinterpret_cast<const volatile uint64_t*>(address));
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);
 	}
@@ -1390,6 +1393,18 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x03: with_interrupt = false; break;
 		case 0x01:
 			if (!IsAsyncComputeQueue()) {
+				// INT_SEL 1 only skips the write confirm; the selected data is still written.
+				if (dst_gpu_addr != nullptr &&
+				    (event_write_source == 0x02 ||
+				     (sizeof(T) == sizeof(uint64_t) && event_write_source == 0x04))) {
+					T data = value;
+					if constexpr (sizeof(T) == sizeof(uint64_t)) {
+						if (event_write_source == 0x04) {
+							data = static_cast<T>(Sync::ReadReferenceClock());
+						}
+					}
+					StoreGuestLabel(m_renderer.GetBufferCache(), dst_gpu_addr, &data, sizeof(data));
+				}
 				Sync::TriggerEopEventAtEndOfPipe(command, m_interrupt_event_id,
 				                                 interrupt_context_id);
 				return;
@@ -1597,8 +1612,18 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+extern std::atomic<uint64_t> g_command_record_seq;
+
+// Sequence value after the last global barrier: if nothing was recorded since, the next one is a
+// no-op (back-to-back EventWrite/ReleaseMem pairs) and only splits render passes.
+static uint64_t g_last_global_barrier_seq = ~0ull;
+
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
+	if (g_command_record_seq.load(std::memory_order_relaxed) ==
+	    g_last_global_barrier_seq) {
+		return;
+	}
 
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -1611,6 +1636,7 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	g_last_global_barrier_seq = g_command_record_seq.load(std::memory_order_relaxed);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 namespace Libs::Graphics {
@@ -23,8 +24,12 @@ bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
 }
 
+std::atomic<uint64_t> g_command_record_seq {0};
+
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
+	// Every recording goes through Handle(); callers compare this to skip redundant barriers.
+	g_command_record_seq.fetch_add(1, std::memory_order_relaxed);
 	return m_buffer;
 }
 
