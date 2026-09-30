@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 
+#include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 
@@ -42,6 +43,8 @@ constexpr uint32_t RecordPermutation = 2;
 constexpr uint64_t MaxFileSize       = 1ull << 31u;
 constexpr uint32_t MaxPayloadSize    = 64u << 20u;
 constexpr uint32_t SpirvMagic        = 0x07230203u;
+// Strings in records are debug names; anything longer is a corrupt record.
+constexpr uint32_t MaxStringSize     = 1u << 20u;
 
 #pragma pack(push, 1)
 struct FileHeader {
@@ -68,8 +71,9 @@ static_assert(sizeof(RecordHeader) == 40);
 
 // The structures below are written field by field. When one of these sizes changes, a field
 // was added or removed: update the matching Write/Read pair, then the size (Windows x64 sizes).
-// A field that fits into padding goes unnoticed here; for shader info and binding layouts the
-// round-trip comparison in Store* still refuses to keep what does not read back equal.
+// A field that fits into padding goes unnoticed here; the round-trip check in Store* compares
+// every member of the read-back plan / compiled info (PlanComparer, CompiledShaderInfo's ==),
+// so a field the writer misses keeps the record from being stored.
 #if defined(_WIN64)
 static_assert(sizeof(IR::ResourcePlan) == 648);
 static_assert(sizeof(IR::ShaderInfo) == 216);
@@ -133,6 +137,7 @@ public:
 	template <typename T>
 	[[nodiscard]] bool Pod(T& value) {
 		static_assert(std::is_trivially_copyable_v<T> && !std::is_pointer_v<T>);
+		CheckOffset();
 		if (m_data.size() - m_offset < sizeof(T)) {
 			return false;
 		}
@@ -163,7 +168,7 @@ public:
 	}
 	[[nodiscard]] bool String(std::string& value) {
 		uint32_t size = 0;
-		if (!U32(size) || m_data.size() - m_offset < size) {
+		if (!U32(size) || size > MaxStringSize || m_data.size() - m_offset < size) {
 			return false;
 		}
 		value.assign(reinterpret_cast<const char*>(m_data.data() + m_offset), size);
@@ -171,6 +176,7 @@ public:
 		return true;
 	}
 	[[nodiscard]] bool Bytes(std::span<const uint8_t>& bytes, uint32_t size) {
+		CheckOffset();
 		if (m_data.size() - m_offset < size) {
 			return false;
 		}
@@ -182,9 +188,17 @@ public:
 	[[nodiscard]] bool Count(uint32_t& count, size_t min_bytes) {
 		return U32(count) && (m_data.size() - m_offset) / min_bytes >= count;
 	}
-	[[nodiscard]] bool Done() const { return m_offset == m_data.size(); }
+	[[nodiscard]] bool Done() const {
+		CheckOffset();
+		return m_offset == m_data.size();
+	}
 
 private:
+	// Every read checks its size first, so the cursor can never pass the end; the unsigned
+	// remaining-size arithmetic above depends on it.
+	// (U32 goes through Pod, so the counted reads are checked before their arithmetic too.)
+	void CheckOffset() const { EXIT_IF(m_offset > m_data.size()); }
+
 	std::span<const uint8_t> m_data;
 	size_t                   m_offset = 0;
 };
@@ -650,6 +664,144 @@ bool ReadCompiledInfo(Reader& r, IR::CompiledShaderInfo& program) {
 	return true;
 }
 
+// Member-by-member equality of a plan and its read-back copy, so a field the writer forgets
+// fails the store check instead of silently defaulting on load. Instructions are matched by their
+// position in value_storage (the two plans own distinct Inst objects). The mutable members after
+// uniform_fill are per-thread evaluation scratch and are not part of the plan.
+class PlanComparer {
+public:
+	PlanComparer(const IR::ResourcePlan& a, const IR::ResourcePlan& b): m_a(a), m_b(b) {
+		uint32_t index = 0;
+		for (const auto& inst: a.value_storage) {
+			m_index_a.emplace(&inst, index++);
+		}
+		index = 0;
+		for (const auto& inst: b.value_storage) {
+			m_index_b.emplace(&inst, index++);
+		}
+	}
+
+	[[nodiscard]] bool Equal() const {
+		if (m_a.stage != m_b.stage || m_a.shader_hash != m_b.shader_hash ||
+		    m_a.user_data_base != m_b.user_data_base || m_a.user_data_count != m_b.user_data_count ||
+		    m_a.value_storage.size() != m_b.value_storage.size()) {
+			return false;
+		}
+		for (auto a = m_a.value_storage.begin(), b = m_b.value_storage.begin();
+		     a != m_a.value_storage.end(); ++a, ++b) {
+			if (!InstEqual(*a, *b)) {
+				return false;
+			}
+		}
+		if (!(m_a.memory_info == m_b.memory_info) ||
+		    m_a.descriptor_sources.size() != m_b.descriptor_sources.size() ||
+		    m_a.control_flow.size() != m_b.control_flow.size() ||
+		    m_a.srt_reads.size() != m_b.srt_reads.size()) {
+			return false;
+		}
+		for (size_t i = 0; i < m_a.descriptor_sources.size(); i++) {
+			if (!SourceEqual(m_a.descriptor_sources[i], m_b.descriptor_sources[i])) {
+				return false;
+			}
+		}
+		for (size_t i = 0; i < m_a.control_flow.size(); i++) {
+			const auto& a = m_a.control_flow[i];
+			const auto& b = m_b.control_flow[i];
+			if (!ValueEqual(a.condition, b.condition) || a.successors != b.successors ||
+			    a.sources != b.sources) {
+				return false;
+			}
+		}
+		for (size_t i = 0; i < m_a.srt_reads.size(); i++) {
+			if (!ValueEqual(m_a.srt_reads[i].value, m_b.srt_reads[i].value) ||
+			    m_a.srt_reads[i].flat_offset != m_b.srt_reads[i].flat_offset) {
+				return false;
+			}
+		}
+		if (m_a.clean_flat_slots != m_b.clean_flat_slots ||
+		    m_a.requires_specialization_memory != m_b.requires_specialization_memory ||
+		    m_a.capture_specialization_reads != m_b.capture_specialization_reads ||
+		    m_a.descriptor_phi_under_writes != m_b.descriptor_phi_under_writes ||
+		    m_a.has_uniform_buffer_reads != m_b.has_uniform_buffer_reads ||
+		    m_a.bindless_images != m_b.bindless_images ||
+		    m_a.srt_plan_complete != m_b.srt_plan_complete ||
+		    m_a.resource_tracking_complete != m_b.resource_tracking_complete ||
+		    !(m_a.info == m_b.info) || !(m_a.uniform_fill.fill == m_b.uniform_fill.fill)) {
+			return false;
+		}
+		for (size_t i = 0; i < m_a.uniform_fill.values.size(); i++) {
+			if (!ValueEqual(m_a.uniform_fill.values[i], m_b.uniform_fill.values[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+private:
+	[[nodiscard]] bool ValueEqual(IR::Value a, IR::Value b) const {
+		const auto* inst_a = a.TryInstruction();
+		const auto* inst_b = b.TryInstruction();
+		if (inst_a == nullptr || inst_b == nullptr) {
+			return inst_a == inst_b && a == b;
+		}
+		const auto found_a = m_index_a.find(inst_a);
+		const auto found_b = m_index_b.find(inst_b);
+		return found_a != m_index_a.end() && found_b != m_index_b.end() &&
+		       found_a->second == found_b->second;
+	}
+
+	[[nodiscard]] bool InstEqual(const IR::Inst& a, const IR::Inst& b) const {
+		if (a.GetOpcode() != b.GetOpcode() || a.Flags<uint64_t>() != b.Flags<uint64_t>() ||
+		    a.Parent() != b.Parent() || a.NumArgs() != b.NumArgs() ||
+		    a.NumPhiBlocks() != b.NumPhiBlocks()) {
+			return false;
+		}
+		for (size_t i = 0; i < a.NumPhiBlocks(); i++) {
+			if (a.PhiBlock(i) != b.PhiBlock(i)) {
+				return false;
+			}
+		}
+		for (size_t i = 0; i < a.NumArgs(); i++) {
+			if (!ValueEqual(a.Arg(i), b.Arg(i))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	[[nodiscard]] bool SourceEqual(const IR::DescriptorSource& a,
+	                               const IR::DescriptorSource& b) const {
+		if (a.dword_count != b.dword_count ||
+		    a.indirect_image.has_value() != b.indirect_image.has_value() ||
+		    a.bindless_sampler != b.bindless_sampler) {
+			return false;
+		}
+		for (size_t i = 0; i < a.dwords.size(); i++) {
+			if (!ValueEqual(a.dwords[i], b.dwords[i])) {
+				return false;
+			}
+		}
+		if (a.indirect_image.has_value()) {
+			const auto& x = *a.indirect_image;
+			const auto& y = *b.indirect_image;
+			if (x.material_source != y.material_source || x.table_source != y.table_source ||
+			    x.selector_stride != y.selector_stride || x.selector_offset != y.selector_offset ||
+			    x.table_offset != y.table_offset || x.key_shift != y.key_shift ||
+			    x.key_mask != y.key_mask || x.bindless != y.bindless ||
+			    !ValueEqual(x.key_count, y.key_count) ||
+			    !ValueEqual(x.selector_mask, y.selector_mask)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	const IR::ResourcePlan&                       m_a;
+	const IR::ResourcePlan&                       m_b;
+	std::unordered_map<const IR::Inst*, uint32_t> m_index_a;
+	std::unordered_map<const IR::Inst*, uint32_t> m_index_b;
+};
+
 // The emulator executable's contents. Any rebuild (a translation change included, committed or
 // not) gives a new identity and starts the file over.
 std::optional<std::array<uint64_t, 2>> BuildId() {
@@ -890,8 +1042,7 @@ void ShaderDiskCache::StorePlan(const Key& key, const IR::ResourcePlan& plan) {
 	Reader           reader(writer.Data());
 	Writer           rewritten;
 	if (!ReadPlan(reader, check) || !reader.Done() || !WritePlan(rewritten, check) ||
-	    rewritten.Data() != writer.Data() || !(check.info == plan.info) ||
-	    !(check.memory_info == plan.memory_info)) {
+	    rewritten.Data() != writer.Data() || !PlanComparer(plan, check).Equal()) {
 		static bool logged = false;
 		if (!std::exchange(logged, true)) {
 			DiskCacheLog("Shader disk cache: a resource plan does not round-trip; not stored");
@@ -925,7 +1076,7 @@ void ShaderDiskCache::StorePermutation(const Key& key, const IR::ResourceSpecial
 	Writer original;
 	WriteCompiledInfo(original, program);
 	if (!check.has_value() || rewritten.Data() != original.Data() ||
-	    !(check->program.info == program.info) || !(check->program.bindings == program.bindings)) {
+	    !(check->program == program)) {
 		static bool logged = false;
 		if (!std::exchange(logged, true)) {
 			DiskCacheLog("Shader disk cache: a compiled shader does not round-trip; not stored");

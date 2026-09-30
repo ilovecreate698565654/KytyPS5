@@ -578,6 +578,7 @@ struct CompiledShaderInfo {
 	uint32_t                      param_export_mask   = 0;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	bool operator==(const CompiledShaderInfo& other) const = default;
 };
 
 struct UniformFillPlan {
