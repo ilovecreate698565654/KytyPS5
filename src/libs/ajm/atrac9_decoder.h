@@ -144,7 +144,8 @@ public:
 				                          static_cast<const uint8_t*>(input) + input_size);
 				m_pending = std::move(tail);
 				consumed  = input_size;
-			} else if (consumed < pending_size) {
+			} else if (consumed < pending_size && (done.result & AJM_RESULT_CODEC_ERROR) == 0) {
+				// Keeping undecodable bytes would replay the same error on every later call.
 				std::vector<uint8_t> tail(static_cast<const uint8_t*>(input) + consumed,
 				                          static_cast<const uint8_t*>(input) + pending_size);
 				m_pending = std::move(tail);
