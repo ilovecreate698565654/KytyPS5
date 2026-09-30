@@ -31480,6 +31480,14 @@ void CheckSampledColorViews() {
           IsSupportedSampledDepthView(
               vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 0, 0, 0)),
           "D16 depth target did not select its R000 depth-aspect view");
+  Require("SampledColorViews", "D16 RRR1 depth target",
+          IsSupportedSampledDepthView(
+              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 4, 4, 1)),
+          "D16 depth target did not select its RRR1 depth-aspect view");
+  Require("SampledColorViews", "depth swizzle reading G",
+          !IsSupportedSampledDepthView(
+              vk::Format::eD16Unorm, vk::Format::eR16Unorm, DstSel(4, 5, 4, 1)),
+          "depth swizzle reading a missing channel was accepted");
   Require("SampledColorViews", "D16S8 R001 depth target",
           IsSupportedSampledDepthView(vk::Format::eD16UnormS8Uint,
                                       vk::Format::eR16Unorm,

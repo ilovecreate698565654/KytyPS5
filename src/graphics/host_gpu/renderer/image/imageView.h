@@ -81,15 +81,19 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {
-	if (!IsSupportedSampledDepthFormat(image_format, view_format)) {
+	if (!IsSupportedSampledDepthFormat(image_format, view_format) || (swizzle & ~0xfffu) != 0) {
 		return false;
 	}
-	switch (swizzle) {
-		case DstSel(4, 4, 4, 4):
-		case DstSel(4, 0, 0, 0):
-		case DstSel(4, 0, 0, 1): return true;
-		default: return false;
+	// A depth-aspect view only has R; each channel may select it or a constant (e.g. RRR1).
+	for (uint32_t channel = 0; channel < 4; channel++) {
+		switch (GetDstSel(swizzle, channel)) {
+			case 0:
+			case 1:
+			case 4: break;
+			default: return false;
+		}
 	}
+	return true;
 }
 
 [[nodiscard]] inline bool
