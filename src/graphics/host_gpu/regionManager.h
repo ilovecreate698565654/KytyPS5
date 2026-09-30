@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -26,6 +28,18 @@
 #endif
 
 namespace Libs::Graphics {
+
+// KYTY_READBACKS=relaxed (shadPS4's "relaxed" readbacks): GPU-written pages stay readable, so
+// guest reads never drain the GPU; they see guest memory, which may lag behind the GPU's copy.
+// Writes still fault and merge with the GPU's bytes first. In Wolverine ~85% of drains were reads
+// of bytes that had not changed.
+inline bool RelaxedReadbacks() {
+	static const bool relaxed = [] {
+		const char* value = std::getenv("KYTY_READBACKS");
+		return value != nullptr && std::string_view(value) == "relaxed";
+	}();
+	return relaxed;
+}
 
 class TrackingSpinLock final {
 public:
@@ -166,6 +180,11 @@ public:
 private:
 	template <bool track, bool is_read>
 	void UpdateProtection() {
+		if constexpr (is_read) {
+			if (RelaxedReadbacks()) {
+				return; // never read-protected, see RelaxedReadbacks
+			}
+		}
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
 		auto&      previous   = is_read ? m_readable : m_writable;
 		auto       mask       = protection ^ previous;
