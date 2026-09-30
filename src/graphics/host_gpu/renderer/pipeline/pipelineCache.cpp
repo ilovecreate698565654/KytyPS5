@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -32,6 +33,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <spirv-tools/libspirv.hpp>
@@ -366,6 +368,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                        skip_dispatch = false;
+		// Set when the plan and permutations of this program may be kept in the disk cache.
+		std::optional<ShaderDiskCache::Key>         disk_key;
 	};
 
 	struct ProgramKeyHash {
@@ -391,7 +395,7 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword, std::vector<uint32_t>* spirv) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -406,6 +410,9 @@ struct PipelineCache::ProgramCache {
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+		}
+		if (spirv != nullptr) {
+			*spirv = std::move(result.spirv);
 		}
 		return {
 		    .specialization = std::move(specialization),
@@ -429,6 +436,9 @@ struct PipelineCache::ProgramCache {
 
 		if (SkipShaderRequested(params.hash)) {
 			return ShaderProgram {};
+		}
+		if (disk_cache != nullptr) {
+			disk_cache->WriteIfDue();
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
@@ -455,6 +465,18 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
+		}
+		const auto [user_data_base, wave_size] = StageLayout(stage, input_info);
+		const bool dump_ir = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		// Debug dumps describe the shaders a session compiles; they bypass the disk cache.
+		const bool use_disk_cache = disk_cache != nullptr && !Config::GraphicsDebugDumpEnabled();
+		std::optional<ShaderDiskCache::Key> disk_key;
+		if (entry == programs.end() && use_disk_cache) {
+			disk_key = DiskKey(params, user_data_base, wave_size, dump_ir);
+			if (auto plan = disk_cache->FindPlan(*disk_key); plan.has_value()) {
+				entry = programs.try_emplace(lookup_key, std::move(*plan)).first;
+				entry->second.disk_key = disk_key;
+			}
 		}
 		SrtLineCache                                 srt_line_cache;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
@@ -498,6 +520,12 @@ struct PipelineCache::ProgramCache {
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			if (entry->second.disk_key.has_value()) {
+				if (const auto handle = LoadDiskPermutation(entry->second, input_info, push_data_cursor);
+				    handle) {
+					return handle;
+				}
+			}
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -525,29 +553,28 @@ struct PipelineCache::ProgramCache {
 		options.shader_hash = params.hash;
 		options.user_data   = user_data;
 		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.dump_ir     = dump_ir;
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
-
-		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
-			options.user_data_base = 8;
-			options.wave_size = input_info.wave_size;
-			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
-				options.user_data_base = 0;
-				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
-			}
-		} else {
-			options.wave_size = input_info.wave_size;
-		}
+		options.user_data_base = user_data_base;
+		options.wave_size      = wave_size;
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
-		options.read_code       = ReadShaderCode;
+		// A translation that inlines code read from guest memory depends on more than the disk
+		// key holds; it is not kept on disk.
+		bool read_guest_code = false;
+		options.read_code    = [&read_guest_code](uint64_t address) {
+			read_guest_code = true;
+			return ReadShaderCode(address);
+		};
 		const auto compile_code = lookup_key.function_code.empty()
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
 		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		const bool disk_storable =
+		    use_disk_cache && !read_guest_code && translated.call_target_user_data.empty();
 		if (translated.skip_dispatch) {
 			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
 			entry->second.skip_dispatch = true;
@@ -581,6 +608,13 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			if (disk_storable) {
+				if (!disk_key.has_value()) {
+					disk_key = DiskKey(params, user_data_base, wave_size, dump_ir);
+				}
+				disk_cache->StorePlan(*disk_key, entry->second.resource_plan);
+				entry->second.disk_key = disk_key;
+			}
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
@@ -597,12 +631,23 @@ struct PipelineCache::ProgramCache {
 				return ShaderProgram {};
 			}
 		}
+		const bool            store_permutation = disk_storable && entry->second.disk_key.has_value();
+		std::vector<uint32_t> spirv;
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    store_permutation ? &spirv : nullptr));
 		const auto& permutation = entry->second.permutations.back();
+		if (store_permutation) {
+			disk_cache->StorePermutation(*entry->second.disk_key, permutation.specialization,
+			                             permutation.program, spirv);
+		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		PrintShaderCounts();
+		return permutation.handle;
+	}
 
+	void PrintShaderCounts() const {
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
@@ -616,6 +661,79 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::Local)],
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+	}
+
+	// user_data_base and wave_size of the translation.
+	template <typename InputInfo>
+	static std::pair<uint32_t, uint32_t> StageLayout(ShaderType stage, const InputInfo& input_info) {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			if (stage == ShaderType::Mesh) {
+				return {0u, input_info.mesh.wave_size};
+			}
+			if (stage == ShaderType::TessellationControl) {
+				return {0u, 64u};
+			}
+			return {8u, input_info.wave_size};
+		} else {
+			return {0u, input_info.wave_size};
+		}
+	}
+
+	// Everything the translation and SPIR-V emission of lookup_key's program depend on besides
+	// the emulator build (in the file header): the exact guest code (the declared hash in the
+	// key is only the guest's own label), the static stage state, and the device and
+	// environment switches the recompiler reads.
+	[[nodiscard]] ShaderDiskCache::Key DiskKey(const ShaderParams& params, uint32_t user_data_base,
+	                                           uint32_t wave_size, bool dump_ir) const {
+		ShaderDiskCache::KeyBuilder key;
+		key.Add(ShaderDiskCache::EnvironmentHash());
+		key.Add(static_cast<uint32_t>(lookup_key.stage));
+		key.Add(lookup_key.hash);
+		key.Add(lookup_key.user_data_count);
+		key.Add(lookup_key.code_size);
+		key.AddWords(lookup_key.static_state);
+		key.AddWords(lookup_key.function_code);
+		key.AddWords(params.code);
+		key.AddWords(params.back_code);
+		key.Add(user_data_base);
+		key.Add(wave_size);
+		key.Add(static_cast<uint8_t>(shader_clock));
+		key.Add(static_cast<uint8_t>(bindless_images));
+		key.Add(static_cast<uint8_t>(Config::FloatImageAtomicsEnabled()));
+		key.Add(static_cast<uint8_t>(ShaderFailureNonFatal()));
+		key.Add(static_cast<uint8_t>(dump_ir));
+		return key.Finish();
+	}
+
+	// A permutation compiled in an earlier session for this program's current specialization.
+	template <typename InputInfo>
+	ShaderProgram LoadDiskPermutation(SourceEntry& source, InputInfo& input_info,
+	                                  uint32_t& push_data_cursor) {
+		auto cached = disk_cache->FindPermutation(
+		    *source.disk_key, source.specialization,
+		    [push_data_cursor](const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+			    const auto& layout = program.bindings;
+			    return layout.push_data_start_dword ==
+			           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+			                                                    layout.ShaderDataDwords());
+		    });
+		if (!cached.has_value() ||
+		    !ValidateShaderSpirv("ShaderDiskCache", cached->program.shader_hash, cached->spirv)) {
+			return {};
+		}
+		const auto module = CompileSPV(cached->spirv, device);
+		if (module == nullptr) {
+			return {};
+		}
+		source.permutations.push_back({
+		    .specialization = source.specialization,
+		    .program        = std::move(cached->program),
+		    .handle         = {.id = ++next_shader_id, .module = module},
+		});
+		const auto& permutation = source.permutations.back();
+		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
+		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		PrintShaderCounts();
 		return permutation.handle;
 	}
 
@@ -658,6 +776,7 @@ struct PipelineCache::ProgramCache {
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	vk::Device                                                  device;
+	std::unique_ptr<ShaderDiskCache>                            disk_cache;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
 	uint64_t                                                    next_shader_id = 0;
@@ -709,6 +828,10 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
           graphics.bindless_enabled && Config::BindlessImagesEnabled())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (const auto title_id = PipelineCacheTitleId(); !title_id.empty()) {
+		m_program_cache->disk_cache =
+		    ShaderDiskCache::Open(std::filesystem::path("_PipelineCache") / (title_id + ".spv.bin"));
+	}
 	// KYTY_SYNC_PIPELINES=1 creates every graphics pipeline on the GPU thread, as before.
 	if (std::getenv("KYTY_SYNC_PIPELINES") == nullptr) {
 		m_compile_queue = std::make_unique<PipelineCompileQueue>(2u);
@@ -819,6 +942,9 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	if (m_program_cache->disk_cache != nullptr) {
+		m_program_cache->disk_cache->Write();
+	}
 	if (m_driver_cache == nullptr) {
 		return;
 	}
