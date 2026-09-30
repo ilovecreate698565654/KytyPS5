@@ -278,8 +278,12 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		const auto unpack =
-		    MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
+		// Compressed export formats: 5 = UNORM16_ABGR, 6 = SNORM16_ABGR, otherwise FP16.
+		// SNORM16 read as FP16 turned 1.0 (0x7fff) into NaN in normal/velocity G-buffers.
+		const auto mode   = MrtOutputMode(state, exp);
+		const auto unpack = mode == 5u   ? GLSLstd450UnpackUnorm2x16
+		                    : mode == 6u ? GLSLstd450UnpackSnorm2x16
+		                                 : GLSLstd450UnpackHalf2x16;
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {

@@ -32,6 +32,12 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 			}
 			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
 		case Decoder::Opcode::UNSUPPORTED:
+			if (TranslationNonFatalFlag()) {
+				LOGF("shader translation: unsupported instruction at pc 0x%08x: %s\n", inst.pc,
+				     Decoder::InstructionToString(inst).c_str());
+				TranslationUnsupportedFlag() = true;
+				return;
+			}
 			EXIT("unsupported decoded instruction: %s", Decoder::InstructionToString(inst).c_str());
 		default: break;
 	}

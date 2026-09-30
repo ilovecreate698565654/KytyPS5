@@ -1661,8 +1661,10 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
 	auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
 	                    ConstantU32(state, 2));
-	if (mem.offset >= 4u) {
-		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
+	// The immediate is signed: -4 must step back one dword, not forward 0x3fffffff.
+	if (mem.offset != 0u) {
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+		               ConstantU32(state, static_cast<uint32_t>(static_cast<int32_t>(mem.offset) >> 2)));
 	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
