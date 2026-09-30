@@ -1171,10 +1171,25 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
+	// A draw whose shaders only render may skip itself while its new pipeline compiles on a
+	// worker (a frame or two of a missing object instead of a multi-second stall). One whose
+	// shaders write memory the game may read back must run, so it waits.
+	bool shader_writes = state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage);
+	for (const auto& stage: vertex_stages) {
+		shader_writes = shader_writes || HasShaderBufferWrites(stage.stage);
+	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, !shader_writes);
+	if (!pipeline.IsReady()) {
+		if (!shader_writes) {
+			ResetBindings();
+			return;
+		}
+		KYTY_PROFILER_BLOCK("WaitPipelineCompile");
+		pipeline.WaitReady();
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,

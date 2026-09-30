@@ -663,6 +663,45 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 };
 
+PipelineCompileQueue::PipelineCompileQueue(uint32_t threads) {
+	for (uint32_t i = 0; i < threads; i++) {
+		m_threads.emplace_back([this](const std::stop_token& stop) { Run(stop); });
+	}
+}
+
+PipelineCompileQueue::~PipelineCompileQueue() {
+	for (auto& thread: m_threads) {
+		thread.request_stop();
+	}
+	m_cv.notify_all();
+	m_threads.clear(); // joins; each worker drains the queue before it exits
+}
+
+void PipelineCompileQueue::Submit(std::function<void()> job) {
+	{
+		std::lock_guard lock(m_mutex);
+		m_jobs.push_back(std::move(job));
+	}
+	m_cv.notify_one();
+}
+
+void PipelineCompileQueue::Run(const std::stop_token& stop) {
+	KYTY_PROFILER_THREAD("Thread_PipelineCompile");
+	for (;;) {
+		std::function<void()> job;
+		{
+			std::unique_lock lock(m_mutex);
+			m_cv.wait(lock, [&] { return !m_jobs.empty() || stop.stop_requested(); });
+			if (m_jobs.empty()) {
+				return;
+			}
+			job = std::move(m_jobs.front());
+			m_jobs.pop_front();
+		}
+		job();
+	}
+}
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
       m_program_cache(std::make_unique<ProgramCache>(
@@ -670,9 +709,15 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
           graphics.bindless_enabled && Config::BindlessImagesEnabled())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	// KYTY_SYNC_PIPELINES=1 creates every graphics pipeline on the GPU thread, as before.
+	if (std::getenv("KYTY_SYNC_PIPELINES") == nullptr) {
+		m_compile_queue = std::make_unique<PipelineCompileQueue>(2u);
+	}
 }
 
 PipelineCache::~PipelineCache() {
+	// Workers still write into the pipelines destroyed below.
+	m_compile_queue.reset();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -985,7 +1030,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-    bool primitive_restart_enable, const GraphicsPrograms& programs) {
+    bool primitive_restart_enable, const GraphicsPrograms& programs, bool allow_async) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
@@ -1150,11 +1195,12 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	auto* async_queue = allow_async ? m_compile_queue.get() : nullptr;
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-	                       ps_input_info, programs, static_params, m_driver_cache);
+	                       ps_input_info, programs, static_params, m_driver_cache, async_queue);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+	EXIT_NOT_IMPLEMENTED(async_queue == nullptr && cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));

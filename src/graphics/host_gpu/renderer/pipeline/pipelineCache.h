@@ -8,13 +8,21 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -104,6 +112,24 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// Worker threads that finish graphics pipelines (vkCreateGraphicsPipelines, up to seconds for a
+// large shader) off the GPU command thread. Queued jobs still run at destruction.
+class PipelineCompileQueue {
+public:
+	explicit PipelineCompileQueue(uint32_t threads);
+	~PipelineCompileQueue();
+	KYTY_CLASS_NO_COPY(PipelineCompileQueue);
+	void Submit(std::function<void()> job);
+
+private:
+	void Run(const std::stop_token& stop);
+
+	std::mutex                        m_mutex;
+	std::condition_variable_any       m_cv;
+	std::deque<std::function<void()>> m_jobs;
+	std::vector<std::jthread>         m_threads;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -119,6 +145,16 @@ public:
 		bool                    uses_push_descriptors = false;
 		// Samples bindless images: descriptor set 1 is the bindless table.
 		bool                    uses_bindless         = false;
+		// False while a compile queue worker is still creating `pipeline`; the layouts are
+		// already valid. A draw may skip itself until then (see GetGraphicsPipeline).
+		std::atomic<bool>       ready                 = true;
+
+		[[nodiscard]] bool IsReady() const { return ready.load(std::memory_order_acquire); }
+		void               WaitReady() const {
+			while (!ready.load(std::memory_order_acquire)) {
+				ready.wait(false, std::memory_order_acquire);
+			}
+		}
 	};
 
 	struct GraphicsPrograms {
@@ -139,12 +175,15 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
+	// A new pipeline is finished on a worker when `allow_async` is set (and KYTY_SYNC_PIPELINES is
+	// not): the result then reports !IsReady() until it exists. Callers that must not skip the
+	// draw (its shaders write memory) pass false, or WaitReady() on a pipeline still compiling.
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                              const GraphicsPrograms& programs);
+	                              const GraphicsPrograms& programs, bool allow_async);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -178,6 +217,7 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	std::unique_ptr<PipelineCompileQueue> m_compile_queue;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	bool                          m_driver_cache_dirty = false;
@@ -200,7 +240,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
+                            vk::PipelineCache                      driver_cache,
+                            PipelineCompileQueue*                  async_queue = nullptr);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
