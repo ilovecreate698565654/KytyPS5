@@ -600,11 +600,18 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 		const auto flag = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), flag, in_range, pending_flag,
 		                          marked_key);
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
-		                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
-		                          index);
-		state.builder.AddFunction(spv::OpStore, pointer, flag);
+		// The host zero-fills the feedback buffer and clears each entry it resolves, so a zero
+		// flag carries nothing. Store only reports: an unconditional store per sample and pixel
+		// piled every invocation onto the same few feedback words.
+		const auto report =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
+		EmitIfCondition(state, report, [&] {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.bindless_feedback_variable,
+			                          ConstantU32(state, 0), index);
+			state.builder.AddFunction(spv::OpStore, pointer, flag);
+		});
 	}
 	const auto slot    = state.builder.AllocateId();
 	// Pending keys sample slot 2 (the blue placeholder) while their texture is loaded.
