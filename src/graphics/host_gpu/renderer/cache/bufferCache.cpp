@@ -330,6 +330,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory");
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -368,6 +369,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (m_hot_windows.size() < MaxHotWindows) {
 			m_hot_windows.push_back({window_begin, window_end, frame});
 		}
+		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			constexpr uint64_t ExtraBudget = 8 * 1024 * 1024;
 			uint64_t           budget      = ExtraBudget;

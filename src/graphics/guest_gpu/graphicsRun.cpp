@@ -188,6 +188,7 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
 	                                                         sequence] {
 		(void)TrySendCommand([this, address, value, size, sequence] {
+			KYTY_PROFILER_BLOCK("GuestGpu::DeferredLabel");
 			StoreGuestLabel(m_renderer.GetBufferCache(), reinterpret_cast<void*>(address), &value, size);
 			const auto pending = m_pending_labels.find(address);
 			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
