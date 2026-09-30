@@ -14,6 +14,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <span>
 #include <unordered_map>
@@ -203,6 +204,28 @@ private:
 	void               ConfirmWritten(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] static bool PrefetchEnabled();
 
+	// Adaptive readback precision (KYTY_READBACK_ADAPTIVE=1). A window whose downloads keep
+	// bringing back the bytes guest memory already held becomes trusted: its read faults then
+	// unprotect its pages without a download, and only every AdaptiveVerifyFaults-th fault (or
+	// after AdaptiveVerifyFrames frames) pays a verified download, which revokes the trust if a
+	// single byte differed. See TrustedReadback for what that costs in correctness.
+	struct AdaptiveWindow {
+		uint32_t unchanged    = 0; // consecutive downloads that changed no byte
+		uint32_t faults       = 0; // trusted faults since the last verified download
+		uint64_t verify_frame = 0; // frame of the last verified download
+	};
+	static constexpr uint32_t AdaptiveTrustDownloads = 8;
+	static constexpr uint32_t AdaptiveVerifyFaults   = 16;
+	static constexpr uint64_t AdaptiveVerifyFrames   = 30;
+	static constexpr size_t   MaxAdaptiveWindows     = 256;
+	[[nodiscard]] static bool AdaptiveEnabled();
+	// Download completion (any thread): whether each window the copies touch changed.
+	void RecordAdaptiveDownload(uint64_t buffer_address, const std::vector<vk::BufferCopy>& copies,
+	                            const uint8_t* mapped, uint64_t offset);
+	// GPU thread: true when the fault on [page_begin, page_end) was served from guest memory.
+	[[nodiscard]] bool TrustedReadback(uint64_t window_begin, uint64_t window_end, uint64_t page_begin,
+	                                   uint64_t page_end, uint64_t frame);
+
 	GraphicContext&                                    m_graphics;
 	// Guest-read windows of the last frames, downloaded together when one read drains (GPU thread).
 	struct HotWindow {
@@ -212,6 +235,9 @@ private:
 	};
 	static constexpr size_t                            MaxHotWindows = 64;
 	std::vector<HotWindow>                             m_hot_windows;
+	// Adaptive windows by window_begin; download completions update them off the GPU thread.
+	std::mutex                                         m_adaptive_mutex;
+	std::unordered_map<uint64_t, AdaptiveWindow>       m_adaptive_windows;
 	std::unordered_map<uint64_t, uint32_t>             m_store_budget; // page -> stores this frame
 	uint64_t                                           m_store_budget_frame = ~0ull;
 	CommandScheduler&                                  m_scheduler;

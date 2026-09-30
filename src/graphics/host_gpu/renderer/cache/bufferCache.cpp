@@ -33,6 +33,8 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+// Nearby CPU reads share one GPU drain of this window (ReadMemory).
+constexpr uint64_t ReadbackWindowSize = 512 * 1024;
 
 } // namespace
 
@@ -185,6 +187,8 @@ namespace {
 // marked written that the shaders never touched); mostly changed means genuine readbacks.
 std::atomic<uint64_t> g_downloaded_bytes {0};
 std::atomic<uint64_t> g_changed_bytes {0};
+// Adaptive readbacks: trusted windows whose verified download found a changed byte.
+std::atomic<uint64_t> g_adaptive_revoked {0};
 
 bool DownloadDiffEnabled() {
 	static const bool enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
@@ -253,6 +257,10 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
 	                                    copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
+		if (AdaptiveEnabled()) {
+			// Before WriteBacking: the diff is against what the guest held until now.
+			RecordAdaptiveDownload(buffer_address, copies, mapped, offset);
+		}
 		for (const auto& copy: copies) {
 			if (DownloadDiffEnabled()) {
 				CountChangedBytes(buffer_address + copy.srcOffset,
@@ -266,6 +274,63 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
 		}
 	});
+}
+
+bool BufferCache::AdaptiveEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_ADAPTIVE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void BufferCache::RecordAdaptiveDownload(uint64_t buffer_address,
+                                         const std::vector<vk::BufferCopy>& copies,
+                                         const uint8_t* mapped, uint64_t offset) {
+	// Windows are keyed as ReadMemory keys them: aligned down, but not below the buffer's start.
+	std::vector<std::pair<uint64_t, bool>> results; // window -> a byte changed
+	std::vector<uint8_t>                   current;
+	for (const auto& copy: copies) {
+		const auto  begin = buffer_address + copy.srcOffset;
+		const auto* data  = mapped + (copy.dstOffset - offset);
+		for (uint64_t done = 0; done < copy.size;) {
+			const auto address = begin + done;
+			const auto aligned = Common::AlignDown(address, ReadbackWindowSize);
+			const auto window  = std::max(aligned, buffer_address);
+			const auto chunk   = std::min<uint64_t>(copy.size - done,
+			                                        aligned + ReadbackWindowSize - address);
+			current.resize(static_cast<size_t>(chunk));
+			// Unreadable guest memory counts as changed: it must never earn a window trust.
+			const bool changed =
+			    !Libs::LibKernel::Memory::TryReadBacking(address, current.data(), chunk) ||
+			    std::memcmp(current.data(), data + done, static_cast<size_t>(chunk)) != 0;
+			const auto found = std::find_if(results.begin(), results.end(),
+			                                [&](const auto& result) { return result.first == window; });
+			if (found != results.end()) {
+				found->second = found->second || changed;
+			} else {
+				results.emplace_back(window, changed);
+			}
+			done += chunk;
+		}
+	}
+	std::scoped_lock lock(m_adaptive_mutex);
+	for (const auto& [window, changed]: results) {
+		// Only windows the guest has read back (ReadMemory creates them) are followed.
+		const auto found = m_adaptive_windows.find(window);
+		if (found == m_adaptive_windows.end()) {
+			continue;
+		}
+		auto& state = found->second;
+		if (changed) {
+			if (state.unchanged >= AdaptiveTrustDownloads) {
+				g_adaptive_revoked.fetch_add(1, std::memory_order_relaxed);
+			}
+			state.unchanged = 0;
+		} else if (state.unchanged < UINT32_MAX) {
+			state.unchanged++;
+		}
+	}
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -398,6 +463,9 @@ struct ReadbackStats {
 	uint64_t                                was_hot      = 0;
 	uint64_t                                extras       = 0;
 	uint64_t                                extra_bytes  = 0;
+	uint64_t                                adaptive_trusted  = 0; // faults served without a drain
+	uint64_t                                adaptive_verified = 0; // forced verified downloads
+	uint64_t                                adaptive_pages    = 0; // pages unprotected on trust
 	std::unordered_map<uint64_t, uint32_t>  windows;
 	std::chrono::steady_clock::time_point   since        = std::chrono::steady_clock::now();
 	uint32_t                                reports      = 0;
@@ -425,6 +493,12 @@ struct ReadbackStats {
 		                    downloaded != 0 ? changed * 100u / downloaded : 0u);
 		if (prefetched != 0) {
 			text += fmt::format("  prefetched windows: {}\n", prefetched);
+		}
+		const auto revoked = g_adaptive_revoked.exchange(0, std::memory_order_relaxed);
+		if (adaptive_trusted + adaptive_verified + revoked != 0) {
+			text += fmt::format("  adaptive: {} of the drains served trusted ({} pages unprotected undownloaded), "
+			                    "{} verified downloads, {} trusts revoked\n",
+			                    adaptive_trusted, adaptive_pages, adaptive_verified, revoked);
 		}
 		if (report_written_pages + report_cleaned_pages != 0) {
 			text += fmt::format("  write reports: {} pages written, {} pages cleaned\n",
@@ -491,6 +565,75 @@ void BufferCache::PrefetchHotWindows() {
 			FinishAsyncDrain(begin, end, begin, 1, false);
 		}
 	});
+}
+
+// CORRECTNESS RISK (why this is opt-in): serving a fault from guest memory drops the GPU-dirty
+// bytes of the window's pages (m_gpu_modified_ranges) without downloading them. Whatever the GPU
+// wrote there that differs from guest memory is lost to the guest: the work already recorded or
+// in flight, and everything up to the GPU's next write of those bytes (which marks them dirty
+// again). Until then the guest reads the stale value, and a guest store to the page makes that
+// stale value the one uploaded over the GPU's. A trusted window can therefore hand the game a
+// stale value for up to AdaptiveVerifyFaults faults or AdaptiveVerifyFrames frames, and only a
+// value the GPU writes again is ever caught (a verified download compares the GPU's bytes with
+// guest memory and revokes the trust on the first difference; the value the guest missed is not
+// replayed). A game that polls a GPU-produced value that rarely changes (a counter, a query
+// result, a fence written into a buffer) can miss the change or see it late. Pages with a
+// download in flight are never touched: that download publishes the GPU's value on landing.
+bool BufferCache::TrustedReadback(uint64_t window_begin, uint64_t window_end, uint64_t page_begin,
+                                  uint64_t page_end, uint64_t frame) {
+	auto* stats = ReadbackStats::Enabled() ? &GetReadbackStats() : nullptr;
+	{
+		std::scoped_lock lock(m_adaptive_mutex);
+		if (m_adaptive_windows.size() >= MaxAdaptiveWindows &&
+		    !m_adaptive_windows.contains(window_begin)) {
+			m_adaptive_windows.clear();
+		}
+		auto& state = m_adaptive_windows[window_begin];
+		if (state.unchanged < AdaptiveTrustDownloads) {
+			state.faults       = 0;
+			state.verify_frame = frame;
+			return false; // not trusted: a normal drain, whose download is counted
+		}
+		if (++state.faults >= AdaptiveVerifyFaults || state.verify_frame + AdaptiveVerifyFrames <= frame) {
+			state.faults       = 0;
+			state.verify_frame = frame;
+			if (stats != nullptr) {
+				stats->adaptive_verified++;
+			}
+			return false; // a verified download: it revokes the trust if a byte changed
+		}
+	}
+	{
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(page_begin, page_end - page_begin)) {
+			return false; // the faulting pages must wait for that download anyway
+		}
+	}
+	// Protection is per page, so every dirty byte of a lifted page goes, also bytes past the
+	// window's end on its last page. Download completions only ever shrink m_downloading_ranges,
+	// so a page found without one stays without one until this GPU thread records another.
+	uint64_t lifted = 0;
+	for (auto page = Common::AlignDown(window_begin, TRACKER_PAGE_SIZE);
+	     page < Common::AlignUp(window_end, TRACKER_PAGE_SIZE); page += TRACKER_PAGE_SIZE) {
+		if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		{
+			std::unique_lock lock(m_dirty_ranges_mutex);
+			if (m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+			m_gpu_modified_ranges.Subtract(page, TRACKER_PAGE_SIZE);
+			m_gpu_written_ranges.Subtract(page, TRACKER_PAGE_SIZE);
+		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		lifted++;
+	}
+	if (stats != nullptr) {
+		stats->adaptive_trusted++;
+		stats->adaptive_pages += lifted;
+	}
+	return true;
 }
 
 uint64_t BufferCache::WriteReportRingAddress() const noexcept {
@@ -795,7 +938,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
+		constexpr uint64_t WindowSize   = ReadbackWindowSize;
 		const auto         buffer_begin = buffer.CpuAddress();
 		const auto         buffer_end   = buffer_begin + buffer.Size();
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
@@ -821,6 +964,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		});
 		if (m_hot_windows.size() < MaxHotWindows) {
 			m_hot_windows.push_back({window_begin, window_end, frame});
+		}
+		// Measured on Wolverine: the same few windows drain ~20 times per 2 s and 83-100% of the
+		// bytes downloaded were unchanged. KYTY_READBACK_ADAPTIVE=1 serves the faults of windows
+		// that proved unchanged from guest memory (see TrustedReadback for the risk).
+		if (AdaptiveEnabled() &&
+		    TrustedReadback(window_begin, window_end, page_begin, page_end, frame)) {
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			return;
 		}
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
