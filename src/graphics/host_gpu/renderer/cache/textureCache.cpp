@@ -787,9 +787,11 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
-	const auto current_tick = m_scheduler.CurrentTick();
+	// Age in presented frames: a frame can span far more than 32 submissions, which let two
+	// layouts at one address free and recreate each other every frame.
+	const auto current_frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	    current_frame - std::min(current_frame, cached.tick_accessed_last) > NumFramesBeforeRemoval;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1319,7 +1321,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (view_layer >= 0) {
 			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
 		}
-		image.tick_accessed_last = m_scheduler.CurrentTick();
+		image.tick_accessed_last = m_graphics.presented_frames.load(std::memory_order_relaxed);
 		TouchImage(image);
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
@@ -2065,6 +2067,11 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
+				// Freeing GPU-written contents that can't be downloaded loses them; the image is
+				// recreated from stale guest memory on its next use. Only critical pressure may.
+				if (!safe && !aggressive) {
+					continue;
+				}
 				constexpr uint64_t WriteBackPerFrame = 256 * MiB;
 				if (safe && owner->info.IsTiled() &&
 				    (!(pressured || aggressive) ||
