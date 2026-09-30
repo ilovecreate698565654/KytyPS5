@@ -180,10 +180,6 @@ public:
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
 
-	// GPU thread only: idle dispatch-recovery snapshot buffers kept for reuse. Owned here so they
-	// are released with the renderer (after the scheduler shuts down), never at static teardown.
-	std::vector<std::unique_ptr<Buffer>>& RecoverySnapshotPool() { return m_recovery_snapshots; }
-
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
@@ -245,7 +241,6 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	// Created at the first thread-dimension indirect dispatch.
 	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
-	std::vector<std::unique_ptr<Buffer>>    m_recovery_snapshots;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
