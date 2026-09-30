@@ -243,6 +243,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_images_by_address[image.info.data.address].push_back(id);
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
@@ -270,6 +271,16 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	if (auto by_address = m_images_by_address.find(image.info.data.address);
+	    by_address != m_images_by_address.end()) {
+		auto& ids = by_address->second;
+		if (const auto found = std::find(ids.begin(), ids.end(), id); found != ids.end()) {
+			ids.erase(found);
+		}
+		if (ids.empty()) {
+			m_images_by_address.erase(by_address);
+		}
+	}
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1271,14 +1282,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
+		// Same backing means the same start address; the last match in registration order wins,
+		// exactly as in the page-owner walk below (same-address images share their first page).
+		if (const auto by_address = m_images_by_address.find(desc.info.data.address);
+		    by_address != m_images_by_address.end()) {
+			for (const auto id: by_address->second) {
+				if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+					result = id;
+				}
 			}
+		}
+		ImageIds candidates;
+		if (!result) {
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 		}
 
 		int32_t view_mip   = -1;

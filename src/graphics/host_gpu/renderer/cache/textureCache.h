@@ -180,6 +180,9 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	// Registered images by start address, in registration order. SameBacking needs an equal
+	// start, so FindImage's usual hit is one lookup instead of a walk over every page owner.
+	std::unordered_map<uint64_t, std::vector<ImageId>> m_images_by_address;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
