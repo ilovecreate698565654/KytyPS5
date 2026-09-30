@@ -213,6 +213,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		KYTY_PROFILER_BLOCK("GuestGpu::QueuedCommand");
 		command();
 	}
 }
@@ -705,9 +706,21 @@ void GuestGpu::ThreadRun(void* data) {
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
+			const auto queue_id   = submission.queue_id;
+			const bool progressed = submission.progressed;
 			submission.blocked = true;
-			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			gpu->m_queues[queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
+			// Progress may have written a label another queue's WAIT_REG_MEM is waiting on; let
+			// those queues re-check now instead of after the idle wait (at least 1 ms). A spurious
+			// re-check makes no progress, flushes nothing and blocks again.
+			if (progressed) {
+				for (uint32_t id = 0; id < QueueCount; id++) {
+					if (id != queue_id && !gpu->m_queues[id].empty()) {
+						gpu->m_queues[id].front().blocked = false;
+					}
+				}
+			}
 		} else {
 			for (auto& queue: gpu->m_queues) {
 				if (!queue.empty()) {
@@ -765,6 +778,7 @@ bool GuestGpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			submission.progressed = progressed;
 			if (progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
@@ -791,7 +805,8 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
+			submission.progressed = submission.command_execution.MadeProgress();
+			if (submission.progressed) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
@@ -950,8 +965,10 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		const auto packet_dw = [&] {
+			KYTY_PROFILER_BLOCK("Pm4Packet");
+			return handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		}();
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;

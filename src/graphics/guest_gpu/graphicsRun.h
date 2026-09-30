@@ -80,6 +80,8 @@ private:
 		bool                      command_complete  = false;
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
+		// The last slice made progress (it may have written a label another queue waits on).
+		bool                      progressed        = false;
 		uint64_t                  flip_request_id   = 0;
 	};
 
