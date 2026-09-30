@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -646,7 +647,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
 	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
-	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+	// Research: KYTY_NV_DIAGNOSTICS=1 enables NVIDIA shader debug info, resource tracking and
+	// shader error reporting for device-lost investigations. They cost GPU time, so normal runs
+	// leave them off.
+	static const bool nv_diagnostics = std::getenv("KYTY_NV_DIAGNOSTICS") != nullptr;
+	if (nv_diagnostics &&
+	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
 		vk::PhysicalDeviceFeatures2                   diagnostics_query {};
 		diagnostics_query.pNext = &supported_diagnostics;
