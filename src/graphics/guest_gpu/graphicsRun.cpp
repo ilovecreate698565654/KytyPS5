@@ -1361,6 +1361,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
+	// The work this label releases is recorded: fetch what the guest will read back after it.
+	m_renderer.GetBufferCache().PrefetchHotWindows();
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {

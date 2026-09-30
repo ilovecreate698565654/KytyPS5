@@ -94,6 +94,10 @@ public:
 	[[nodiscard]] uint32_t OpenWriteReport(uint64_t vaddr, uint64_t size);
 	// After each draw or dispatch is recorded: its open reports belong to the current tick.
 	void                   CommitWriteReports();
+	// GPU thread, at each end-of-pipe label (KYTY_READBACK_PREFETCH=1): the windows the guest
+	// read back recently are downloaded right behind the work the label releases, and unprotected
+	// once they land, so the guest's next read of them runs without a fault or a drain.
+	void                   PrefetchHotWindows();
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -197,6 +201,7 @@ private:
 	void               FlushWriteReports();
 	void               RetireWriteReports(std::vector<WriteReport> reports);
 	void               ConfirmWritten(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool PrefetchEnabled();
 
 	GraphicContext&                                    m_graphics;
 	// Guest-read windows of the last frames, downloaded together when one read drains (GPU thread).

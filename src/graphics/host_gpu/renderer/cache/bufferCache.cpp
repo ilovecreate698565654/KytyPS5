@@ -390,6 +390,7 @@ struct ReadbackStats {
 	uint64_t                                calls        = 0;
 	uint64_t                                stores       = 0;
 	uint64_t                                report_written_pages = 0;
+	uint64_t                                prefetched = 0;
 	uint64_t                                report_cleaned_pages = 0;
 	uint64_t                                writes       = 0;
 	uint64_t                                fast_path    = 0;
@@ -422,6 +423,9 @@ struct ReadbackStats {
 		text += fmt::format("  downloaded {} KiB of GPU-dirty bytes, {} KiB changed ({}%)\n",
 		                    downloaded / 1024u, changed / 1024u,
 		                    downloaded != 0 ? changed * 100u / downloaded : 0u);
+		if (prefetched != 0) {
+			text += fmt::format("  prefetched windows: {}\n", prefetched);
+		}
 		if (report_written_pages + report_cleaned_pages != 0) {
 			text += fmt::format("  write reports: {} pages written, {} pages cleaned\n",
 			                    report_written_pages, report_cleaned_pages);
@@ -443,6 +447,51 @@ ReadbackStats& GetReadbackStats() {
 }
 
 } // namespace
+
+bool BufferCache::PrefetchEnabled() {
+	static const bool enabled = std::getenv("KYTY_READBACK_PREFETCH") != nullptr;
+	return enabled;
+}
+
+void BufferCache::PrefetchHotWindows() {
+	if (!PrefetchEnabled() || m_hot_windows.empty() || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	std::vector<std::pair<uint64_t, uint64_t>> fetched;
+	for (const auto& window: m_hot_windows) {
+		const auto bytes = window.end - window.begin;
+		if (window.frame + 120u < frame || bytes == 0) {
+			continue;
+		}
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (!m_gpu_modified_ranges.Intersects(window.begin, bytes)) {
+				continue; // nothing written since the last download
+			}
+		}
+		const auto* owner = m_page_table.Find(window.begin >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(window.begin, bytes)) {
+			continue;
+		}
+		if (DownloadBufferMemory(m_slot_buffers[*owner], window.begin, bytes)) {
+			fetched.emplace_back(window.begin, window.end);
+		}
+	}
+	if (fetched.empty()) {
+		return;
+	}
+	if (ReadbackStats::Enabled()) {
+		GetReadbackStats().prefetched += fetched.size();
+	}
+	// Runs on the GPU thread once the tick completed and its downloads were published; pages the
+	// GPU has written again since stay protected (FinishAsyncDrain checks).
+	m_scheduler.DeferOperation([this, fetched = std::move(fetched)] {
+		for (const auto& [begin, end]: fetched) {
+			FinishAsyncDrain(begin, end, begin, 1, false);
+		}
+	});
+}
 
 uint64_t BufferCache::WriteReportRingAddress() const noexcept {
 	return m_report_ring != nullptr ? m_report_ring->BufferDeviceAddress() : 0;
@@ -764,8 +813,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			                      ? 1u
 			                      : 0u;
 		}
+		// Prefetched windows stop faulting, so they are only refreshed by a drain now and then:
+		// keep them longer than the two frames batching needed.
+		const uint64_t keep_frames = PrefetchEnabled() ? 120u : 2u;
 		std::erase_if(m_hot_windows, [&](const HotWindow& window) {
-			return window.frame + 2u < frame || window.begin == window_begin;
+			return window.frame + keep_frames < frame || window.begin == window_begin;
 		});
 		if (m_hot_windows.size() < MaxHotWindows) {
 			m_hot_windows.push_back({window_begin, window_end, frame});
