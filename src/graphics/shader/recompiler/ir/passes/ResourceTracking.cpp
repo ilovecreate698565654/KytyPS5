@@ -273,6 +273,9 @@ public:
 			return;
 		}
 		PlanScalarReads();
+		if (m_failed) {
+			return;
+		}
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectImages();
 		if (m_failed) {
@@ -859,10 +862,15 @@ private:
 				    AddressOpcodeInfoOf(op).access == AddressAccess::None &&
 				    image.access == ImageAccess::None) continue;
 				const auto flags = inst.Flags<MemoryFlags>();
-				if (flags.index >= m_program.memory_info.size())
+				// Fail returns in nonfatal mode; stop before indexing past the metadata or args.
+				if (flags.index >= m_program.memory_info.size()) {
 					Fail(flags.pc, "memory metadata index is out of range");
-				if (inst.NumArgs() < (image.needs_sampler ? 2u : 1u))
+					return;
+				}
+				if (inst.NumArgs() < (image.needs_sampler ? 2u : 1u)) {
 					Fail(flags.pc, "memory operation has no resource handle");
+					return;
+				}
 				const auto& memory = m_program.memory_info[flags.index];
 				if ((op == ValueOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarBuffer) ||
 				    (op == ValueOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarAddress))
@@ -883,6 +891,7 @@ private:
 					MakeSource(*handle, width, sampler,
 					           sampler && (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
 					           base, source, flags.pc);
+					if (m_failed) return;
 					for (uint32_t word = 0; word < width; ++word)
 						CollectScalarRead(source.dwords[word], flags.pc);
 				}
@@ -2453,10 +2462,16 @@ private:
 				    sampler->NumArgs() != 4u || FindBindlessSampler(*sampler) != nullptr) {
 					continue;
 				}
+				// Validate exactly what Collect will: MakeSource returns the source PlanScalarReads
+				// built for this handle, with the lowering and canonicalization a raw check skips.
+				const auto  flags  = inst.Flags<MemoryFlags>();
+				const auto& memory = m_program.memory_info[flags.index];
 				DescriptorSource descriptor;
-				descriptor.dword_count = 4u;
-				for (uint32_t dword = 0; dword < 4u; dword++) {
-					descriptor.dwords[dword] = LowerDescriptorPhi(sampler->Arg(dword));
+				MakeSource(*sampler, 4u, true,
+				           (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
+				           memory.sampler * 4u, descriptor, flags.pc);
+				if (m_failed) {
+					return;
 				}
 				uint32_t bad_dword = 0;
 				if (ValidateSource(descriptor, bad_dword)) {
