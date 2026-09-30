@@ -55,6 +55,13 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// Marks a buffer bound through FindBuffer as used, so the collector doesn't evict a buffer
+	// that is bound every frame. GPU thread only (the LRU is not synchronized).
+	void MarkUsed(BufferId id) {
+		if (!IsBufferInvalid(id)) {
+			TouchBuffer(m_slot_buffers[id]);
+		}
+	}
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,

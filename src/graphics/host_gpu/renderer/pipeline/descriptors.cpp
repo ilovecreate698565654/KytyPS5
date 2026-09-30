@@ -1068,7 +1068,9 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		const auto id = cache.FindBuffer(address, size);
+		cache.MarkUsed(id);
+		prepared.buffer_sources.push_back({address, size, id});
 	}
 }
 
