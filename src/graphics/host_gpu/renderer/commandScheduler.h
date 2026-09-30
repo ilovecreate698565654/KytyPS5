@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 
 #include <queue>
@@ -38,6 +39,11 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Runs on the recording thread right before each submission ends the command buffer, while
+	// operations are still accepted (never during shutdown). One hook; null clears it.
+	void                      SetPreSubmitHook(std::function<void()> hook) {
+		m_pre_submit = std::move(hook);
+	}
 	// Any thread: waits for a tick that has already been submitted (never the one recording).
 	void                      WaitSubmitted(uint64_t tick) {
 		EXIT_IF(tick >= CurrentTick());
@@ -102,6 +108,8 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::function<void()>        m_pre_submit;
+	bool                         m_in_pre_submit        = false;
 };
 
 } // namespace Libs::Graphics

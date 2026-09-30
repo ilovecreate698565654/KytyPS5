@@ -148,6 +148,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    m_downloading_ranges.Add(start, end - start);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    m_gpu_written_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
@@ -281,6 +282,21 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
+	if (std::getenv("KYTY_WRITE_REPORTS") != nullptr) {
+		// Host-visible so the retire reads the bits and clears them without GPU commands;
+		// device-preferred so the shaders' atomics stay in video memory where possible.
+		constexpr uint64_t RingBytes = 4ull * 1024 * 1024;
+		m_report_ring                = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst |
+		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    RingBytes);
+		EXIT_IF(m_report_ring->Mapped().empty() || !m_report_ring->HasDeviceAddress());
+		m_report_ring_words = static_cast<uint32_t>(RingBytes / sizeof(uint32_t));
+		std::memset(m_report_ring->Mapped().data(), 0, RingBytes);
+		m_report_ring->Flush(0, RingBytes);
+		m_scheduler.SetPreSubmitHook([this] { FlushWriteReports(); });
+	}
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
 	const auto null_id =
@@ -302,6 +318,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_report_ring != nullptr) {
+		m_scheduler.SetPreSubmitHook(nullptr);
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -346,6 +365,7 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 		// Overwritten in full: guest memory holds the value the GPU copy will have.
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Subtract(vaddr, size);
+		m_gpu_written_ranges.Subtract(vaddr, size);
 	}
 	// A tracker page marked GPU-modified must still hold GPU-dirty bytes; otherwise the GC's
 	// download of an aged buffer finds nothing to copy and exits.
@@ -367,6 +387,8 @@ namespace {
 struct ReadbackStats {
 	uint64_t                                calls        = 0;
 	uint64_t                                stores       = 0;
+	uint64_t                                report_written_pages = 0;
+	uint64_t                                report_cleaned_pages = 0;
 	uint64_t                                writes       = 0;
 	uint64_t                                fast_path    = 0;
 	uint64_t                                drains       = 0;
@@ -398,6 +420,10 @@ struct ReadbackStats {
 		text += fmt::format("  downloaded {} KiB of GPU-dirty bytes, {} KiB changed ({}%)\n",
 		                    downloaded / 1024u, changed / 1024u,
 		                    downloaded != 0 ? changed * 100u / downloaded : 0u);
+		if (report_written_pages + report_cleaned_pages != 0) {
+			text += fmt::format("  write reports: {} pages written, {} pages cleaned\n",
+			                    report_written_pages, report_cleaned_pages);
+		}
 		for (size_t i = 0; i < std::min<size_t>(top.size(), 8u); i++) {
 			text += fmt::format("  window 0x{:012x} x{}\n", top[i].first, top[i].second);
 		}
@@ -415,6 +441,220 @@ ReadbackStats& GetReadbackStats() {
 }
 
 } // namespace
+
+uint64_t BufferCache::WriteReportRingAddress() const noexcept {
+	return m_report_ring != nullptr ? m_report_ring->BufferDeviceAddress() : 0;
+}
+
+bool BufferCache::AllocateReportWords(uint32_t words, uint32_t& offset, uint32_t& alloc) {
+	uint32_t used = 0;
+	for (const auto& a: m_report_allocs) {
+		used += a.words;
+	}
+	auto start = m_report_ring_head;
+	auto taken = words;
+	if (start + words > m_report_ring_words) {
+		taken += m_report_ring_words - start; // skip the tail; allocations stay contiguous
+		start = 0;
+	}
+	if (used + taken > m_report_ring_words) {
+		return false;
+	}
+	m_report_allocs.push_back({start, taken, false});
+	alloc              = m_report_alloc_base + static_cast<uint32_t>(m_report_allocs.size() - 1);
+	offset             = start;
+	m_report_ring_head = start + words;
+	return true;
+}
+
+void BufferCache::FreeReportWords(uint32_t alloc) {
+	m_report_allocs[alloc - m_report_alloc_base].freed = true;
+	while (!m_report_allocs.empty() && m_report_allocs.front().freed) {
+		m_report_allocs.pop_front();
+		m_report_alloc_base++;
+	}
+}
+
+void BufferCache::ConfirmWritten(uint64_t vaddr, uint64_t size) {
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	m_gpu_modified_ranges.ForEachInRange(
+	    vaddr, size, [&](uint64_t begin, uint64_t end) { m_gpu_written_ranges.Add(begin, end - begin); });
+}
+
+uint32_t BufferCache::OpenWriteReport(uint64_t vaddr, uint64_t size) {
+	constexpr uint32_t Off = 0xffffffffu;
+	if (m_report_ring == nullptr || size == 0) {
+		return Off;
+	}
+	const auto phase_dwords = static_cast<uint32_t>((vaddr & (TRACKER_PAGE_SIZE - 1)) / 4u);
+	const auto dwords       = (size + 3u) / 4u;
+	const auto pages        = (phase_dwords + dwords + 1023u) / 1024u;
+	const auto words        = (pages + 31u) / 32u;
+	const auto key          = vaddr * 0x9e3779b97f4a7c15ull ^ size;
+	if (const auto found = m_current_report_index.find(key); found != m_current_report_index.end()) {
+		auto& report = m_current_reports[found->second];
+		if (report.vaddr == vaddr && report.size == size) {
+			report.open = true; // bound again before this tick is submitted
+			return (report.word << 10u) | phase_dwords;
+		}
+	}
+	uint32_t offset = 0;
+	uint32_t alloc  = 0;
+	if (words >= (1u << 22u) || !AllocateReportWords(static_cast<uint32_t>(words), offset, alloc) ||
+	    offset >= (1u << 22u) - 1u) {
+		ConfirmWritten(vaddr, size);
+		return Off;
+	}
+	m_current_report_index[key] = m_current_reports.size();
+	m_current_reports.push_back({.vaddr = vaddr,
+	                             .size  = size,
+	                             .word  = offset,
+	                             .words = static_cast<uint32_t>(words),
+	                             .alloc = alloc,
+	                             .open  = true});
+	return (offset << 10u) | phase_dwords;
+}
+
+void BufferCache::CommitWriteReports() {
+	for (auto& report: m_current_reports) {
+		report.open = false;
+	}
+}
+
+void BufferCache::FlushWriteReports() {
+	if (m_current_reports.empty()) {
+		return;
+	}
+	// Reports still open belong to a draw or dispatch not recorded yet (a stream-buffer wrap can
+	// submit while one is being prepared): they move on with it to the next tick.
+	std::vector<WriteReport> retiring;
+	std::vector<WriteReport> kept;
+	for (auto& report: m_current_reports) {
+		(report.open ? kept : retiring).push_back(report);
+	}
+	m_current_reports = std::move(kept);
+	m_current_report_index.clear();
+	for (size_t i = 0; i < m_current_reports.size(); i++) {
+		const auto& report = m_current_reports[i];
+		m_current_report_index[report.vaddr * 0x9e3779b97f4a7c15ull ^ report.size] = i;
+	}
+	if (retiring.empty()) {
+		return;
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                 vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr,
+	                                 0, nullptr);
+	m_retiring_ranges.push_back(retiring);
+	m_scheduler.DeferOperation([this, reports = std::move(retiring)]() mutable {
+		RetireWriteReports(std::move(reports));
+	});
+}
+
+void BufferCache::RetireWriteReports(std::vector<WriteReport> reports) {
+	KYTY_PROFILER_BLOCK("BufferCache::RetireWriteReports");
+	EXIT_IF(m_retiring_ranges.empty());
+	m_retiring_ranges.pop_front(); // batches complete in submission order
+	auto* ring = reinterpret_cast<uint32_t*>(m_report_ring->Mapped().data());
+	for (const auto& report: reports) {
+		m_report_ring->Invalidate(report.word * sizeof(uint32_t), report.words * sizeof(uint32_t));
+	}
+	const auto page_segment = [](const WriteReport& report, uint64_t page, uint64_t& begin,
+	                             uint64_t& end) {
+		const auto base = Common::AlignDown(report.vaddr, TRACKER_PAGE_SIZE);
+		begin           = std::max(report.vaddr, base + page * TRACKER_PAGE_SIZE);
+		end             = std::min(report.vaddr + report.size, base + (page + 1u) * TRACKER_PAGE_SIZE);
+		return begin < end;
+	};
+	const auto page_count = [](const WriteReport& report) {
+		const auto base = Common::AlignDown(report.vaddr, TRACKER_PAGE_SIZE);
+		return (report.vaddr + report.size - base + TRACKER_PAGE_SIZE - 1u) / TRACKER_PAGE_SIZE;
+	};
+	uint64_t written_pages = 0;
+	uint64_t cleaned_pages = 0;
+	// Written pages first, so another report of this batch can't clean them.
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& report: reports) {
+			const auto pages = page_count(report);
+			for (uint64_t page = 0; page < pages; page++) {
+				if ((ring[report.word + page / 32u] & (1u << (page % 32u))) == 0) {
+					continue;
+				}
+				uint64_t begin = 0;
+				uint64_t end   = 0;
+				if (page_segment(report, page, begin, end)) {
+					written_pages++;
+					m_gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](uint64_t b, uint64_t e) {
+						m_gpu_written_ranges.Add(b, e - b);
+					});
+				}
+			}
+		}
+	}
+	// A page can only be cleaned when no other report still in flight or being recorded covers
+	// it: that work may yet write it.
+	RangeSet pending;
+	for (const auto& batch: m_retiring_ranges) {
+		for (const auto& report: batch) {
+			pending.Add(report.vaddr, report.size);
+		}
+	}
+	for (const auto& report: m_current_reports) {
+		pending.Add(report.vaddr, report.size);
+	}
+	std::vector<uint64_t> touched;
+	{
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& report: reports) {
+			const auto pages = page_count(report);
+			for (uint64_t page = 0; page < pages; page++) {
+				if ((ring[report.word + page / 32u] & (1u << (page % 32u))) != 0) {
+					continue;
+				}
+				uint64_t begin = 0;
+				uint64_t end   = 0;
+				if (!page_segment(report, page, begin, end) ||
+				    !m_gpu_modified_ranges.Intersects(begin, end - begin) ||
+				    pending.Intersects(begin, end - begin) ||
+				    m_downloading_ranges.Intersects(begin, end - begin) ||
+				    m_gpu_written_ranges.Intersects(begin, end - begin)) {
+					continue;
+				}
+				m_gpu_modified_ranges.Subtract(begin, end - begin);
+				touched.push_back(Common::AlignDown(begin, TRACKER_PAGE_SIZE));
+				cleaned_pages++;
+			}
+		}
+	}
+	for (const auto page: touched) {
+		if (m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) &&
+		    !HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+			bool downloading = false;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				downloading = m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE);
+			}
+			if (!downloading) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			}
+		}
+	}
+	for (const auto& report: reports) {
+		std::memset(ring + report.word, 0, report.words * sizeof(uint32_t));
+		m_report_ring->Flush(report.word * sizeof(uint32_t), report.words * sizeof(uint32_t));
+		FreeReportWords(report.alloc);
+	}
+	if (ReadbackStats::Enabled()) {
+		auto& stats = GetReadbackStats();
+		stats.report_written_pages += written_pages;
+		stats.report_cleaned_pages += cleaned_pages;
+	}
+}
 
 bool BufferCache::WriteStore(uint64_t vaddr, const void* data, uint64_t size) {
 	constexpr uint32_t StoresPerPagePerFrame = 16;
@@ -824,7 +1064,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id, bool needs_device_address) {
+                                                       BufferId id, bool needs_device_address,
+                                                       bool reported) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -853,6 +1094,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
+		if (WriteReportsEnabled() && !reported) {
+			m_gpu_written_ranges.Add(vaddr, size);
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

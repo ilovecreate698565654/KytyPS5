@@ -366,6 +366,18 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
+	if (m_pre_submit && !m_in_pre_submit) {
+		bool open = false;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			open = m_operation_state == OperationState::Open;
+		}
+		if (open) {
+			m_in_pre_submit = true;
+			m_pre_submit();
+			m_in_pre_submit = false;
+		}
+	}
 	m_command.End();
 	const auto buffer   = m_command.m_buffer;
 	auto&      graphics = m_graphics;

@@ -11,7 +11,9 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <deque>
 #include <map>
+#include <memory>
 #include <shared_mutex>
 #include <span>
 #include <unordered_map>
@@ -69,11 +71,29 @@ public:
 	}
 	// needs_device_address: the caller reads the data through a buffer device address, which
 	// the stream buffer used for small CPU-written reads does not have.
+	// reported: the caller binds a written range whose shader reports the pages it writes, and
+	// calls OpenWriteReport for it next (see below); every other GPU write is taken as exact.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer      = false,
 	                                                        BufferId id                   = {},
-	                                                        bool     needs_device_address = false);
+	                                                        bool     needs_device_address = false,
+	                                                        bool     reported             = false);
+
+	// Write reports (KYTY_WRITE_REPORTS=1; GPU thread only). A written storage binding is marked
+	// GPU-dirty whole, although shaders usually write a small part of it (Wolverine: 3-17% of the
+	// downloaded "dirty" bytes had changed). A reporting shader sets one bit per 4 KiB page it
+	// writes in a ring; when its submission completes, pages whose bit stayed clear stop being
+	// GPU-dirty, so guest reads of them no longer drain the GPU.
+	[[nodiscard]] bool     WriteReportsEnabled() const noexcept { return m_report_ring != nullptr; }
+	[[nodiscard]] uint64_t WriteReportRingAddress() const noexcept;
+	// The bound range [vaddr, vaddr + size) of a binding obtained with reported = true. Returns
+	// (word_base << 10) | phase_dwords: page p = (dword_index + phase_dwords) >> 10 relative to
+	// AlignDown(vaddr, 4 KiB) sets bit (p & 31) of ring word word_base + (p >> 5). 0xFFFFFFFF
+	// means reporting is off for the binding (the range is then taken as written in full).
+	[[nodiscard]] uint32_t OpenWriteReport(uint64_t vaddr, uint64_t size);
+	// After each draw or dispatch is recorded: its open reports belong to the current tick.
+	void                   CommitWriteReports();
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -159,6 +179,25 @@ private:
 	void               DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
 	                                        uint64_t total_size);
 
+	struct WriteReport {
+		uint64_t vaddr     = 0;
+		uint64_t size      = 0;
+		uint32_t word      = 0; // first ring word
+		uint32_t words     = 0;
+		uint32_t alloc     = 0; // index into m_report_allocs
+		bool     open      = true;
+	};
+	struct ReportAlloc {
+		uint32_t offset = 0;
+		uint32_t words  = 0; // including words skipped at the ring's end
+		bool     freed  = false;
+	};
+	[[nodiscard]] bool AllocateReportWords(uint32_t words, uint32_t& offset, uint32_t& alloc);
+	void               FreeReportWords(uint32_t alloc);
+	void               FlushWriteReports();
+	void               RetireWriteReports(std::vector<WriteReport> reports);
+	void               ConfirmWritten(uint64_t vaddr, uint64_t size);
+
 	GraphicContext&                                    m_graphics;
 	// Guest-read windows of the last frames, downloaded together when one read drains (GPU thread).
 	struct HotWindow {
@@ -179,6 +218,17 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
+	// Write reports: GPU-dirty bytes known to be written (unreported writes, and reported pages
+	// whose bit was set). A report never cleans these; they leave with the dirty bytes.
+	RangeSet                                           m_gpu_written_ranges;
+	std::unique_ptr<Buffer>                            m_report_ring;
+	uint32_t                                           m_report_ring_words = 0;
+	uint32_t                                           m_report_ring_head  = 0;
+	uint32_t                                           m_report_alloc_base = 0; // index of front
+	std::deque<ReportAlloc>                            m_report_allocs;
+	std::vector<WriteReport>                           m_current_reports; // this tick's reports
+	std::unordered_map<uint64_t, size_t>               m_current_report_index;
+	std::deque<std::vector<WriteReport>>               m_retiring_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
 	// Guards changes to both range sets (GPU thread and download completions) against
