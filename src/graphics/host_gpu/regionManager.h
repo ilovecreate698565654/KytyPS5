@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -33,11 +34,18 @@ public:
 		if (m_owner.load(std::memory_order_relaxed) == thread) {
 			EXIT("recursive region tracking lock\n");
 		}
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			if (m_owner.load(std::memory_order_relaxed) == thread) {
 				EXIT("recursive region tracking lock while contended\n");
 			}
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			// Holders can sit in VirtualProtect or a page walk; yield instead of competing with
+			// them for the core once a short spin hasn't won.
+			if (++spins < 64) {
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+			} else {
+				std::this_thread::yield();
+			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}

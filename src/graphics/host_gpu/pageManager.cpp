@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -61,8 +62,13 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
+		uint32_t spins = 0;
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			if (++spins < 64) {
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+			} else {
+				std::this_thread::yield();
+			}
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
