@@ -170,6 +170,41 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	return true;
 }
 
+// Resource materialization reads descriptor tables one dword at a time, and every read pays the
+// GPU-clean check (buffer dirty ranges, texture page walk, address-space lookup). Within one
+// materialization nothing marks memory GPU-dirty, so a 64-byte line that passed the check once
+// can serve the neighbouring dwords. Lines that fail keep the per-dword path unchanged.
+struct SrtLineCache {
+	static constexpr uint64_t LineBytes = 64;
+
+	uint64_t                               line   = UINT64_MAX;
+	uint64_t                               failed = UINT64_MAX;
+	std::array<uint32_t, LineBytes / 4u>   words {};
+};
+
+template <bool Specialization>
+bool ReadShaderGuestMemoryLine(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto* cache = static_cast<SrtLineCache*>(userdata);
+	if (cache != nullptr && values.size() == 1u && (address & 3u) == 0u) {
+		const auto line = address & ~(SrtLineCache::LineBytes - 1u);
+		if (line != cache->line && line != cache->failed) {
+			std::array<uint32_t, SrtLineCache::LineBytes / 4u> words {};
+			if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(line, words.data(), sizeof(words))) {
+				cache->words = words;
+				cache->line  = line;
+			} else {
+				cache->failed = line;
+			}
+		}
+		if (line == cache->line) {
+			values[0] = cache->words[(address - line) / 4u];
+			return true;
+		}
+	}
+	return Specialization ? ReadShaderGuestMemory(nullptr, address, values)
+	                      : ReadShaderGuestMemoryRaw(nullptr, address, values);
+}
+
 // --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
 // these guest shaders, the same way a shader that fails to compile is skipped. To see what one
 // shader contributes, to step past one that loses the device, or to leave out work nothing can
@@ -417,11 +452,13 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
+		SrtLineCache                                 srt_line_cache;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
-		    .read_memory                = ReadShaderGuestMemoryRaw,
-		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .read_memory                = ReadShaderGuestMemoryLine<false>,
+		    .userdata                   = &srt_line_cache,
+		    .read_specialization_memory = ReadShaderGuestMemoryLine<true>,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
 		if (entry != programs.end()) {
@@ -928,6 +965,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const GraphicsPrograms& programs) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
