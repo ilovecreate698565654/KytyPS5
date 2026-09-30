@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "common/profiler.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -208,6 +209,14 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	KYTY_PROFILER_FUNCTION();
+	{
+		// Runs per draw and dispatch: skip the driver's semaphore query when nothing waits.
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.empty()) {
+			return;
+		}
+	}
 	m_master.Refresh();
 	for (;;) {
 		PendingOperation operation;
