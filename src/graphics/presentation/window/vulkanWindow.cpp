@@ -1057,7 +1057,10 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+		// Research: KYTY_NV_CHECKPOINTS=1 records NVIDIA checkpoints for device-lost dumps. Draws
+		// record several each, so normal runs leave them off.
+		if (std::getenv("KYTY_NV_CHECKPOINTS") != nullptr &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
 			graphic_ctx.diagnostic_checkpoints_enabled = true;
 		}
