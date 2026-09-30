@@ -840,7 +840,20 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
-		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
+		// The emulator's own writes (bindless feedback, fault reports, watchdogs) make the host
+		// shader look side-effecting, which forces late depth tests: hidden fragments then run the
+		// whole shader. A guest shader that writes no memory, kills nothing and exports no depth or
+		// mask cannot observe early versus late testing, so request early tests for it too.
+		const auto& info         = state.program.info;
+		const bool  guest_writes =
+		    state.program.has_address_writes ||
+		    std::any_of(info.buffers.begin(), info.buffers.end(),
+		                [](const auto& buffer) { return buffer.written || buffer.atomic; }) ||
+		    std::any_of(info.images.begin(), info.images.end(),
+		                [](const auto& image) { return image.written || image.atomic; }) ||
+		    IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::Gds) != nullptr;
+		if ((state.input_info.pixel->ps_early_z || !guest_writes) && state.depth_variable == 0 &&
+		    !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
