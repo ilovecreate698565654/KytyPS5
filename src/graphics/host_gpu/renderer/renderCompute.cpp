@@ -604,6 +604,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		// The write reports opened while binding belong to this dispatch's submission.
+		m_context.GetBufferCache().CommitWriteReports();
 
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -705,6 +707,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		m_context.GetBufferCache().CommitWriteReports();
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
 	ResetBindings();

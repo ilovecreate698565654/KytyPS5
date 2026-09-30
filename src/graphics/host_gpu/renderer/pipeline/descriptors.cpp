@@ -111,10 +111,15 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// report: the shader reports the pages it writes to this binding (BindingLayout::
+// has_write_reports); write_report receives the packed value the shader needs, WriteReportOff
+// when the binding is not tracked.
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset,
+                    bool report, uint32_t& write_report) {
 	buffer_offset = 0;
+	write_report  = ShaderRecompiler::IR::WriteReportOff;
 
 	const auto& [address, size, id] = source;
 	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
@@ -125,8 +130,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	auto&      cache    = context.GetBufferCache();
+	const bool reported = report && resource.written && cache.WriteReportsEnabled();
+	auto [buffer, offset] = cache.ObtainBuffer(address, size, resource.written, resource.formatted,
+	                                           id, false, reported);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -135,6 +142,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	if (reported) {
+		// The shader indexes dwords from the start of the bound range, which begins adjustment
+		// bytes before the guest address.
+		write_report = cache.OpenWriteReport(address - adjustment, size + adjustment);
+	}
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -775,6 +787,9 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 }
 
 void RenderExecutor::ResetBindings() {
+	// A draw or dispatch that stopped after binding (a skipped draw) never runs its shaders: its
+	// open write reports stay clear, which is exact for it.
+	m_context.GetBufferCache().CommitWriteReports();
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
 			image->binding = {};
@@ -1106,13 +1121,24 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	const auto report_dword = layout.WriteReportDword();
+	if (layout.has_write_reports) {
+		// Zero when the cache has no ring: every binding then reports off.
+		const auto ring = m_context.GetBufferCache().WriteReportRingAddress();
+		prepared.shader_data[report_dword]      = static_cast<uint32_t>(ring);
+		prepared.shader_data[report_dword + 1u] = static_cast<uint32_t>(ring >> 32u);
+	}
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[resource],
-		                                               buffer_offset));
+		uint32_t write_report  = ShaderRecompiler::IR::WriteReportOff;
+		prepared.buffers.push_back(NativeStorageBuffer(
+		    m_context, prepared.buffer_sources[i], program.info.buffers[resource], buffer_offset,
+		    layout.has_write_reports, write_report));
 		pack_memory_offset(i, buffer_offset);
+		if (layout.has_write_reports) {
+			prepared.shader_data[report_dword + 2u + i] = write_report;
+		}
 		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
 		// buffer still has no accessible elements. In particular, never let a null store
 		// modify the shared fallback and affect subsequent null reads.
