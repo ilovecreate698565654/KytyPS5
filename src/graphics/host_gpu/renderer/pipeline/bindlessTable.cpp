@@ -160,10 +160,13 @@ void BindlessTable::WriteDefaultSampler(vk::Sampler sampler) {
 bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              heap,
                                       std::span<const std::array<uint32_t, 4>> records,
                                       SamplerCache&                             cache) {
-	const auto same_prefix =
-	    records.size() >= heap.records.size() &&
-	    std::equal(heap.records.begin(), heap.records.end(), records.begin());
-	if (same_prefix && records.size() == heap.records.size()) {
+	// A shorter read of the same heap (the record count comes from whichever draw prepares it
+	// first) is a prefix of what is mirrored, not a change: relocating for it leaked a region
+	// each time until the sampler array ran out and the heap froze.
+	const auto common      = std::min(records.size(), heap.records.size());
+	const auto same_prefix = std::equal(records.begin(), records.begin() + common,
+	                                    heap.records.begin());
+	if (same_prefix && records.size() <= heap.records.size()) {
 		return true;
 	}
 	uint32_t first = static_cast<uint32_t>(heap.records.size());
@@ -435,7 +438,10 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 	heap.table_offset = table_offset;
 	heap.binding      = binding;
 	heap.resource     = resource;
-	if (!AllocateRegion(heap, std::max(entries, 1u << 14u))) {
+	// Regions are never reclaimed; a 16k-entry floor (32k after headroom) filled the translation
+	// buffer after ~30 heaps, and every later heap sampled the placeholder. AllocateRegion
+	// already doubles for growth.
+	if (!AllocateRegion(heap, entries)) {
 		m_heaps.pop_back();
 		return nullptr;
 	}
