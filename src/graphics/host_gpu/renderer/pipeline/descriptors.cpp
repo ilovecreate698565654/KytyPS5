@@ -966,7 +966,10 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 	}
 	ResolveBindlessRequests();
 	for (const auto& use: snapshot.bindless_heaps) {
+		// Every skipped use still needs its patch: an unpatched mapping slot leaves guest words
+		// where the shader reads its region and count.
 		if (use.image >= program.info.images.size()) {
+			prepared.bindless_patches.push_back({use.mapping_offset, 0u, 0u});
 			continue;
 		}
 		const auto& resource = program.info.images[use.image];
@@ -975,7 +978,9 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
 		                                    entries, resource);
 		if (heap == nullptr) {
-			continue; // region 0, count 0: every key samples the placeholder
+			// region 0, count 0: every key samples the placeholder
+			prepared.bindless_patches.push_back({use.mapping_offset, 0u, 0u});
+			continue;
 		}
 		prepared.bindless_patches.push_back(
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
