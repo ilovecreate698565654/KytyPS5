@@ -24,6 +24,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -850,6 +851,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 
 static std::mutex                   g_rejected_tessellation_mutex;
 static std::unordered_set<uint64_t> g_rejected_tessellation;
+// Accepted setups keep their reflected strides: re-decoding LS and HS on every tessellated draw
+// cost far more than the draw's own setup.
+static std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> g_accepted_tessellation;
 
 static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
                                        const HW::ShaderRegisters&  sh) {
@@ -864,10 +868,15 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
                                  std::array<ShaderParams, 3>&          params) {
 	const auto& sh        = context.GetShaderRegisters();
 	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	std::optional<std::pair<uint32_t, uint32_t>> strides;
 	{
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
 		if (g_rejected_tessellation.contains(tess_key)) {
 			return false;
+		}
+		if (const auto found = g_accepted_tessellation.find(tess_key);
+		    found != g_accepted_tessellation.end()) {
+			strides = found->second;
 		}
 	}
 	const auto  local     = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
@@ -917,10 +926,17 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+	if (strides) {
+		tess.ls_stride = strides->first;
+		tess.hs_stride = strides->second;
+	} else if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code,
+	                                                          tess)) {
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
 		g_rejected_tessellation.insert(tess_key);
 		return false;
+	} else {
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		g_accepted_tessellation.emplace(tess_key, std::pair {tess.ls_stride, tess.hs_stride});
 	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
