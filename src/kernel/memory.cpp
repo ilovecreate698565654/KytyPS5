@@ -901,7 +901,10 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
-	if (clamped_size != 0 && clamped_size != size) {
+	// Buffers are bound per draw and dispatch; log only the first clamps.
+	static std::atomic<uint32_t> reported {0};
+	if (clamped_size != 0 && clamped_size != size &&
+	    reported.fetch_add(1, std::memory_order_relaxed) < 32) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
 		     vaddr, size, clamped_size);

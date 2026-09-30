@@ -94,7 +94,9 @@ uint32_t ReleaseMemCacheActionFromGcr(uint32_t gcr_cntl) {
 
 void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 	const uint32_t unknown = (gcr_cntl & ~GcrKnownMask);
-	if (unknown != 0) {
+	// release_mem runs thousands of times a second; report the first few only.
+	static std::atomic<uint32_t> reported {0};
+	if (unknown != 0 && reported.fetch_add(1, std::memory_order_relaxed) < 64) {
 		LOGF("\t warning: release_mem uses unknown GCR bits: 0x%04" PRIx32 "\n", unknown);
 	}
 }
