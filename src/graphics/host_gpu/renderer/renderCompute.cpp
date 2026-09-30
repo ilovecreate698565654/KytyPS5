@@ -136,11 +136,15 @@ public:
 		auto&      policy = RecoveryPolicy();
 		if (report.page_count == 0) {
 			if (report.trap.claimed != 0) {
-				const auto hash =
-				    (uint64_t {report.trap.shader_hash_high} << 32) | report.trap.shader_hash_low;
-				EXIT("GPU shader trap after page residency: hash=0x%016" PRIx64
-				     " pc=0x%08x code=0x%02x\n",
-				     hash, report.trap.pc, report.trap.code);
+				// A trap on guest data; the hardware carries on, so keep this attempt's results.
+				static std::atomic<uint32_t> reported {0};
+				if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+					const auto hash =
+					    (uint64_t {report.trap.shader_hash_high} << 32) | report.trap.shader_hash_low;
+					LOGF("GPU shader trap after page residency (ignored): hash=0x%016" PRIx64
+					     " pc=0x%08x code=0x%02x\n",
+					     hash, report.trap.pc, report.trap.code);
+				}
 			}
 			if (m_attempts == 0) {
 				policy.clean_runs[m_shader_address]++;

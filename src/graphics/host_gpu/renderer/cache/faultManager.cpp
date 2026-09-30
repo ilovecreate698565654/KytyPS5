@@ -9,7 +9,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <fmt/format.h>
 #include <cinttypes>
 #include <cstring>
 #include <limits>
@@ -188,12 +190,18 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		m_download_buffer.Invalidate(offset, m_download_area_size);
 		ShaderTrapRecord trap;
 		std::memcpy(&trap, mapped + PageFaultAreaSize, sizeof(trap));
+		// Traps fire on guest data (a garbage descriptor in a lane whose result is unused, a call
+		// table rewritten after recording); the hardware carries on, so report and continue.
 		if (trap.claimed != 0 && report == nullptr) {
-			const auto  hash    = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
-			const auto* pending = std::bit_cast<const uint64_t*>(mapped);
-			EXIT("GPU shader trap: hash=0x%016" PRIx64
-			     " pc=0x%08x code=0x%02x pending_pages=%" PRIu64 " first_page=%016" PRIx64 "\n",
-			     hash, trap.pc, trap.code, pending[0], pending[1]);
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				const auto  hash = (uint64_t {trap.shader_hash_high} << 32) | trap.shader_hash_low;
+				const auto* pending = std::bit_cast<const uint64_t*>(mapped);
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Warning: GPU shader trap (ignored): hash=0x{:016x} pc=0x{:08x} code=0x{:02x} "
+				    "pending_pages={} first_page={:016x}\n",
+				    hash, trap.pc, trap.code, pending[0], pending[1]));
+			}
 		}
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
