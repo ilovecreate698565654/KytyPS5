@@ -88,6 +88,7 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	uint64_t                  m_fault_process_frame   = UINT64_MAX;
 	uint64_t                  m_bda_synced_epoch      = 0;
 
 	Common::Mutex                        m_interrupt_mutex;

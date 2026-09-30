@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "common/profiler.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -114,6 +115,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		KYTY_PROFILER_BLOCK("RenderContext::UnmapMemory");
 		// Completions write guest memory only for GPU-dirty buffer ranges, pending image
 		// downloads and deferred labels; uploads copy guest memory when recorded and deleted
 		// resources are retired by tick. Without any of those in the range, nothing asynchronous
@@ -156,8 +158,13 @@ void RenderContext::PrepareBda() {
 }
 
 void RenderContext::RunGarbageCollector() {
-	if (m_fault_process_pending) {
+	// The scan dispatches over the whole fault bitmap and may wait on older work; it ran after
+	// every completed submission slice (hundreds per frame). Once per presented frame is enough
+	// to create buffers for first-touched pages; dispatch recovery collects its own faults.
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	if (m_fault_process_pending && frame != m_fault_process_frame) {
 		m_fault_process_pending = false;
+		m_fault_process_frame   = frame;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
