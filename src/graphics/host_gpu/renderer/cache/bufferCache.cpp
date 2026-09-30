@@ -311,6 +311,14 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Subtract(vaddr, size);
 	}
+	// A tracker page marked GPU-modified must still hold GPU-dirty bytes; otherwise the GC's
+	// download of an aged buffer finds nothing to copy and exits.
+	for (auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	     page < Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE); page += TRACKER_PAGE_SIZE) {
+		if (!HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
 	m_texture_cache.InvalidateMemory(vaddr, size);
 	return true;
 }
@@ -761,8 +769,9 @@ void BufferCache::RunGarbageCollector() {
 		// forever, and the images that share those pages are then re-sourced from the
 		// buffer's stale contents: the world renders black. Measured 2026-09-21.
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty) {
-			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
+		// A page can stay marked GPU-modified with no dirty bytes left to copy (the CPU overwrote
+		// them); such a buffer has nothing to download and retires like a clean one.
+		if (dirty && DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size())) {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
