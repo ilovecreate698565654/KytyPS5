@@ -352,6 +352,7 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& hw       = buffer.GetRegisters();
 	const auto& z        = hw.GetDepthRenderTarget();
 	const auto& override = hw.GetDepthRenderOverride();
