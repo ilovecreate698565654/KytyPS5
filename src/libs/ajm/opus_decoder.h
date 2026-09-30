@@ -142,7 +142,11 @@ public:
 			const auto* data      = static_cast<const uint8_t*>(input) + result.input_consumed;
 			const auto  remaining = input_size - result.input_consumed;
 			if (remaining < 2) {
-				result.result = AJM_RESULT_PARTIAL_INPUT;
+				// Ending exactly on a packet boundary is a complete decode, as in the AT9 decoder;
+				// reporting partial input made the game treat finished voices as errors.
+				if (remaining != 0 || result.input_consumed == 0) {
+					result.result = AJM_RESULT_PARTIAL_INPUT;
+				}
 				break;
 			}
 			const auto packet_size = static_cast<uint32_t>(data[0]) | (uint32_t {data[1]} << 8u);
