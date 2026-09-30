@@ -73,6 +73,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_untracked_compute      = false;
+	bool                   null_unsupported_textures   = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -120,6 +121,7 @@ bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool PlayGoHackEnabled();
 bool SkipUntrackedComputeEnabled();
+bool NullUnsupportedTexturesEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

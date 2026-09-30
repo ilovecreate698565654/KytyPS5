@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -175,6 +176,15 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	return metadata_control == expected_control && GuestRange {metadata_addr, 1}.Valid() &&
 	       (metadata_addr & 0x7fffu) == 0 &&
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
+}
+
+static bool IsSupportedSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                                           const ShaderTextureResource& descriptor,
+                                           const Image& image, vk::Format view_format) {
+	return IsSupportedSampledDepthResource(resource) &&
+	       IsSupportedDepthTextureEncoding(descriptor, resource.r128) &&
+	       IsSupportedSampledDepthView(image.info.pixel_format, view_format,
+	                                   descriptor.DstSelXYZW());
 }
 
 static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
@@ -378,6 +388,21 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	return desc;
 }
 
+// With --null-unsupported-textures, a sampled texture this renderer can't represent yet is bound as
+// the null texture (like a null descriptor) instead of exiting, so a game can progress past it.
+static bool NullUnsupportedSampledTexture(bool storage, uint64_t address, const char* reason) {
+	if (storage || !Config::NullUnsupportedTexturesEnabled()) {
+		return false;
+	}
+	static std::atomic<uint32_t> warnings {0};
+	if (warnings.fetch_add(1, std::memory_order_relaxed) < 64) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Warning: binding a null texture for unsupported sampled texture at 0x{:016x}: {}\n",
+		    address, reason));
+	}
+	return true;
+}
+
 static void PopulateTextureMipLayout(ImageInfo& info) {
 	if (info.IsVolume() && info.tile_mode != Prospero::TileMode::kLinear) {
 		TileSurfaceLayout            surface {};
@@ -545,11 +570,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
+	const auto null_binding = [&]() -> TextureBinding {
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
+	};
+	if (descriptor.IsNull()) {
+		return null_binding();
 	}
 
 	const auto address         = descriptor.Base40();
@@ -578,6 +606,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
+		if (NullUnsupportedSampledTexture(storage, address, "unsupported texture mip view")) {
+			return null_binding();
+		}
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
 		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
@@ -600,6 +631,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
+		if (NullUnsupportedSampledTexture(storage, address, "sampled image numeric class mismatch")) {
+			return null_binding();
+		}
 		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
 		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
 	}
@@ -616,6 +650,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
 		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
 		                           view_levels, levels, view_base)) {
+			if (NullUnsupportedSampledTexture(storage, address,
+			                                  "texture mip view changes physical layout")) {
+				return null_binding();
+			}
 			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
 			     "extent=%ux%ux%u tile=%u\n",
 			     base_level, last_level, max_mip, width, height, depth,
@@ -630,6 +668,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                              : TileGetRenderTargetPitch(width, bytes, last_level);
 		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
 		    size.size > UINT32_MAX / image_layers) {
+			if (NullUnsupportedSampledTexture(storage, address,
+			                                  "unsupported multisample texture layout")) {
+				return null_binding();
+			}
 			EXIT("unsupported multisample texture layout\n");
 		}
 		size.size *= image_layers;
@@ -700,10 +742,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
+		if (!IsSupportedSampledDepthBinding(resource, descriptor, *image, pixel_format) &&
+		    NullUnsupportedSampledTexture(storage, address, "unsupported sampled depth image")) {
+			return null_binding();
+		}
 		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
+		if (!IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
+		                                 descriptor.DstSelXYZW()) &&
+		    NullUnsupportedSampledTexture(storage, address, "unsupported sampled color view")) {
+			return null_binding();
+		}
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}

@@ -151,6 +151,10 @@ bool SkipUntrackedComputeEnabled() {
 	return g_config->skip_untracked_compute;
 }
 
+bool NullUnsupportedTexturesEnabled() {
+	return g_config->null_unsupported_textures;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
