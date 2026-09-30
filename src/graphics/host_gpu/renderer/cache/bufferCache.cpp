@@ -691,6 +691,16 @@ uint32_t BufferCache::OpenWriteReport(uint64_t vaddr, uint64_t size) {
 	if (m_report_ring == nullptr || size == 0) {
 		return Off;
 	}
+	// Small bindings are cheap to download and rarely where the drains are; the per-store
+	// compare isn't worth it there. KYTY_WRITE_REPORT_MIN_KB overrides the 64 KiB threshold.
+	static const uint64_t min_bytes = [] {
+		const char* value = std::getenv("KYTY_WRITE_REPORT_MIN_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 64ull) * 1024u;
+	}();
+	if (size < min_bytes) {
+		ConfirmWritten(vaddr, size);
+		return Off;
+	}
 	const auto phase_dwords = static_cast<uint32_t>((vaddr & (TRACKER_PAGE_SIZE - 1)) / 4u);
 	const auto dwords       = (size + 3u) / 4u;
 	const auto pages        = (phase_dwords + dwords + 1023u) / 1024u;

@@ -768,17 +768,20 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
+	// Write reports combine the lanes' page bits with subgroup operations.
+	const bool write_reports = state.program.bindings.has_write_reports;
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
-	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
+	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id ||
+	    write_reports) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (state.lane_count == 2 || state.requirements.subgroup_ballot || write_reports) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
-	if (state.requirements.subgroup_arithmetic) {
+	if (state.requirements.subgroup_arithmetic || write_reports) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {

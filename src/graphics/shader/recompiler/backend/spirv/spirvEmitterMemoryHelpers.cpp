@@ -117,32 +117,57 @@ void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, ui
 		const auto bit = EmitBinaryU32(
 		    state, spv::OpShiftLeftLogical, ConstantU32(state, 1u),
 		    EmitBinaryU32(state, spv::OpBitwiseAnd, page, ConstantU32(state, 31u)));
-		const auto byte_offset =
-		    EmitBinaryU32(state, spv::OpShiftLeftLogical, word, ConstantU32(state, 2u));
-		const auto byte_offset64 = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpUConvert, TypeScalarU64(state), byte_offset64,
-		                          byte_offset);
-		const auto address = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpIAdd, TypeScalarU64(state), address,
-		                          state.write_report_ring, byte_offset64);
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-		                          address);
-		// Most writes land on pages already reported: a load keeps them from all contending for
-		// the same word with read-modify-writes.
-		const auto current = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, pointer,
-		                          ConstantU32(state, spv::ScopeDevice),
-		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
-		const auto missing = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), missing,
-		                          EmitBinaryU32(state, spv::OpBitwiseAnd, current, bit),
+		// Sets `bits` in ring word `ring_word` unless they are all set already.
+		const auto report = [&](uint32_t ring_word, uint32_t bits) {
+			const auto byte_offset =
+			    EmitBinaryU32(state, spv::OpShiftLeftLogical, ring_word, ConstantU32(state, 2u));
+			const auto byte_offset64 = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpUConvert, TypeScalarU64(state), byte_offset64,
+			                          byte_offset);
+			const auto address = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpIAdd, TypeScalarU64(state), address,
+			                          state.write_report_ring, byte_offset64);
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          address);
+			// Most writes land on pages already reported: a load keeps them from all contending
+			// for the same word with read-modify-writes.
+			const auto current = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, pointer,
+			                          ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+			const auto missing = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), missing,
+			                          EmitBinaryU32(state, spv::OpBitwiseAnd, current, bits), bits);
+			EmitIfCondition(state, missing, [&]() {
+				state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state),
+				                          state.builder.AllocateId(), pointer,
+				                          ConstantU32(state, spv::ScopeDevice),
+				                          ConstantU32(state, spv::MemorySemanticsMaskNone), bits);
+			});
+		};
+		// Lanes of a subgroup usually write the same ring word (neighbouring pages): the lowest
+		// active lane reports the bits of every lane sharing its word in one access, and only
+		// lanes with another word report their own. Over-reporting is always safe; a lane's bit
+		// is never dropped (it either shares the first word or reports itself).
+		const auto subgroup   = ConstantU32(state, spv::ScopeSubgroup);
+		const auto first_word = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32(state), first_word,
+		                          subgroup, word);
+		const auto same = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), same, word, first_word);
+		const auto shared_bit = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), shared_bit, same, bit,
 		                          ConstantU32(state, 0u));
-		EmitIfCondition(state, missing, [&]() {
-			state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
-			                          pointer, ConstantU32(state, spv::ScopeDevice),
-			                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
-		});
+		const auto shared_bits = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformBitwiseOr, TypeU32(state), shared_bits,
+		                          subgroup, spv::GroupOperationReduce, shared_bit);
+		const auto elected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected, subgroup);
+		EmitIfCondition(state, elected, [&]() { report(first_word, shared_bits); });
+		const auto other = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), other, same);
+		EmitIfCondition(state, other, [&]() { report(word, bit); });
 	});
 }
 
