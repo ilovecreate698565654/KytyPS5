@@ -90,6 +90,15 @@ static bool LabelsAfterGpu() {
 	return enabled;
 }
 
+// Labels often share a page with bytes the GPU wrote. A plain store then takes the tracked-page
+// write fault, which downloads the page and drains the GPU inside the packet; WriteClean writes
+// the host and GPU copies instead, and falls back to the plain store whenever that isn't safe.
+static void StoreGuestLabel(auto& cache, void* dst, const void* src, size_t size) {
+	if (!cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, size)) {
+		std::memcpy(dst, src, size);
+	}
+}
+
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -179,7 +188,7 @@ void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) 
 	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
 	                                                         sequence] {
 		(void)TrySendCommand([this, address, value, size, sequence] {
-			std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			StoreGuestLabel(m_renderer.GetBufferCache(), reinterpret_cast<void*>(address), &value, size);
 			const auto pending = m_pending_labels.find(address);
 			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
 				m_pending_labels.erase(pending);
@@ -541,7 +550,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	StoreGuestLabel(m_renderer.GetBufferCache(), reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -1402,7 +1411,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
 			                                    sizeof(data));
 		} else {
-			std::memcpy(dst, &data, sizeof(data));
+			StoreGuestLabel(m_renderer.GetBufferCache(), dst, &data, sizeof(data));
 		}
 
 		if (with_interrupt) {
@@ -1469,7 +1478,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
 						                                    value, sizeof(value));
 					} else {
-						std::memcpy(dst, &value, sizeof(value));
+						StoreGuestLabel(m_renderer.GetBufferCache(), dst, &value, sizeof(value));
 					}
 
 					if (with_interrupt) {
@@ -1712,7 +1721,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	if (LabelsAfterGpu()) {
 		PublishLabelAtCompletion(dst_gpu_addr, value, sizeof(value), false);
 	} else {
-		std::memcpy(dst_gpu_addr, &value, sizeof(value));
+		StoreGuestLabel(m_renderer.GetBufferCache(), dst_gpu_addr, &value, sizeof(value));
 	}
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1741,7 +1750,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (LabelsAfterGpu()) {
 		PublishLabelAtCompletion(dst_gpu_addr, value, sizeof(value), false);
 	} else {
-		std::memcpy(dst_gpu_addr, &value, sizeof(value));
+		StoreGuestLabel(m_renderer.GetBufferCache(), dst_gpu_addr, &value, sizeof(value));
 	}
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
