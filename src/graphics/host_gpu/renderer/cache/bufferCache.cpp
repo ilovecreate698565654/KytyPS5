@@ -282,7 +282,9 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
-	if (std::getenv("KYTY_WRITE_REPORTS") != nullptr) {
+	// Same test as the shader side: a value starting with 1 turns reports on.
+	if (const char* reports = std::getenv("KYTY_WRITE_REPORTS");
+	    reports != nullptr && reports[0] == '1') {
 		// Host-visible so the retire reads the bits and clears them without GPU commands;
 		// device-preferred so the shaders' atomics stay in video memory where possible.
 		constexpr uint64_t RingBytes = 4ull * 1024 * 1024;
