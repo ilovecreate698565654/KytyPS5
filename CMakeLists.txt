@@ -176,6 +176,17 @@ add_custom_target(KytyGitVersion
 add_library(kyty_git_version INTERFACE)
 add_dependencies(kyty_git_version KytyGitVersion)
 
+# Identity of the shader translation code for the shader disk cache (see generate_shader_hash.cmake).
+add_custom_target(KytyShaderHash
+	COMMAND ${CMAKE_COMMAND}
+		-D SOURCE_DIR=${KYTY_SOURCE_DIR}
+		-D OUTPUT_FILE=${PROJECT_BINARY_DIR}/kytyShaderHash.h
+		-P ${KYTY_SOURCE_DIR}/generate_shader_hash.cmake
+	BYPRODUCTS ${PROJECT_BINARY_DIR}/kytyShaderHash.h
+	COMMENT "Generate kytyShaderHash.h"
+)
+add_dependencies(kyty_git_version KytyShaderHash)
+
 if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
 		kyty_emulator

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "kytyShaderHash.h"
 
 #include <algorithm>
 #include <bit>
@@ -34,7 +35,7 @@ namespace IR = ShaderRecompiler::IR;
 namespace {
 
 // Bump when the file layout or the serialized structures change meaning. Translation changes
-// need no bump: every rebuild of the emulator starts the file over (see BuildId).
+// need no bump: a change to the translation sources starts the file over (see BuildId).
 constexpr uint32_t FormatVersion = 1;
 constexpr uint64_t FileMagic     = 0x31565053594b594bull; // "KYKYSPV1"
 constexpr uint32_t RecordMagic   = 0x4345524bu;           // "KREC"
@@ -802,51 +803,16 @@ private:
 	std::unordered_map<const IR::Inst*, uint32_t> m_index_b;
 };
 
-// The emulator executable's contents. Any rebuild (a translation change included, committed or
-// not) gives a new identity and starts the file over.
+// The shader translation code (the recompiler and the program cache), hashed at build time by
+// generate_shader_hash.cmake. Rebuilds that change other code (audio, saves, memory) keep the
+// file; any change to translation starts it over. Other inputs (KYTY_ switches, device and config
+// features) are part of every record's key.
 std::optional<std::array<uint64_t, 2>> BuildId() {
-#ifdef _WIN32
-	std::wstring path(32768, L'\0');
-	const auto   length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
-	if (length == 0 || length >= path.size()) {
+	constexpr std::string_view translation = KYTY_SHADER_TRANSLATION_HASH;
+	if (translation.empty()) {
 		return std::nullopt;
 	}
-	path.resize(length);
-	const std::filesystem::path exe(path);
-#else
-	std::error_code             error;
-	const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", error);
-	if (error) {
-		return std::nullopt;
-	}
-#endif
-	Common::File file(exe, Common::File::Mode::Read);
-	if (file.IsInvalid()) {
-		return std::nullopt;
-	}
-	auto* state = XXH3_createState();
-	if (state == nullptr || XXH3_128bits_reset(state) != XXH_OK) {
-		XXH3_freeState(state);
-		return std::nullopt;
-	}
-	std::vector<uint8_t> chunk(4u << 20u);
-	uint64_t             total = 0;
-	for (;;) {
-		uint32_t read = 0;
-		file.Read(chunk.data(), static_cast<uint32_t>(chunk.size()), &read);
-		if (read == 0) {
-			break;
-		}
-		XXH3_128bits_update(state, chunk.data(), read);
-		total += read;
-	}
-	const auto size = file.Size();
-	file.Close();
-	const auto hash = XXH3_128bits_digest(state);
-	XXH3_freeState(state);
-	if (total != size || total == 0) {
-		return std::nullopt;
-	}
+	const auto hash = XXH3_128bits(translation.data(), translation.size());
 	return std::array<uint64_t, 2> {hash.low64, hash.high64};
 }
 
