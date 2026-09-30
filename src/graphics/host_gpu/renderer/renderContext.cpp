@@ -114,7 +114,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_command_scheduler.Active()) {
+		// Completions write guest memory only for GPU-dirty buffer ranges, pending image
+		// downloads and deferred labels; uploads copy guest memory when recorded and deleted
+		// resources are retired by tick. Without any of those in the range, nothing asynchronous
+		// touches it, so the unmap doesn't need to drain the GPU (a drain per guest munmap).
+		const bool gpu_owned = m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
+		                       m_texture_cache.IsRegionGpuModified(vaddr, size) ||
+		                       m_texture_cache.HasPendingDownload(vaddr, size) ||
+		                       GuestGpu::LabelsDeferred();
+		if (gpu_owned && m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
