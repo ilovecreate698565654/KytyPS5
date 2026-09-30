@@ -60,6 +60,81 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_dword_lengths[i] =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
+	if (!state.program.bindings.has_write_reports) {
+		return;
+	}
+	const auto report_dword = state.program.bindings.WriteReportDword();
+	const auto ring_low     = EmitShaderDataDwordLoad(state, report_dword);
+	const auto ring_high    = EmitShaderDataDwordLoad(state, report_dword + 1u);
+	const auto low64        = state.builder.AllocateId();
+	const auto high64       = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUConvert, TypeScalarU64(state), low64, ring_low);
+	state.builder.AddFunction(spv::OpUConvert, TypeScalarU64(state), high64, ring_high);
+	const auto shifted = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpShiftLeftLogical, TypeScalarU64(state), shifted, high64,
+	    state.builder.Constant(spv::OpConstant, TypeScalarU64(state), 32u, 0u));
+	state.write_report_ring = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeScalarU64(state), state.write_report_ring,
+	                          low64, shifted);
+	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+		state.write_report_packed[i] = EmitShaderDataDwordLoad(state, report_dword + 2u + i);
+	}
+}
+
+void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
+	if (access.write_report == 0) {
+		return;
+	}
+	state.write_report_sites++;
+	// The host passes WriteReportOff for a binding it doesn't track (read-only, small, or no ring
+	// space); it then treats the whole binding as written, as without reports.
+	const auto enabled = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), enabled, access.write_report,
+	                          ConstantU32(state, IR::WriteReportOff));
+	EmitIfCondition(state, enabled, [&]() {
+		constexpr uint32_t PhaseMask = (1u << IR::WriteReportPhaseBits) - 1u;
+		const auto base  = EmitBinaryU32(state, spv::OpShiftRightLogical, access.write_report,
+		                                 ConstantU32(state, IR::WriteReportPhaseBits));
+		const auto phase = EmitBinaryU32(state, spv::OpBitwiseAnd, access.write_report,
+		                                 ConstantU32(state, PhaseMask));
+		// 1024 dwords per 4 KiB page.
+		const auto page = EmitBinaryU32(state, spv::OpShiftRightLogical,
+		                                EmitBinaryU32(state, spv::OpIAdd, index, phase),
+		                                ConstantU32(state, 10u));
+		const auto word = EmitBinaryU32(
+		    state, spv::OpIAdd, base,
+		    EmitBinaryU32(state, spv::OpShiftRightLogical, page, ConstantU32(state, 5u)));
+		const auto bit = EmitBinaryU32(
+		    state, spv::OpShiftLeftLogical, ConstantU32(state, 1u),
+		    EmitBinaryU32(state, spv::OpBitwiseAnd, page, ConstantU32(state, 31u)));
+		const auto byte_offset =
+		    EmitBinaryU32(state, spv::OpShiftLeftLogical, word, ConstantU32(state, 2u));
+		const auto byte_offset64 = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUConvert, TypeScalarU64(state), byte_offset64,
+		                          byte_offset);
+		const auto address = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIAdd, TypeScalarU64(state), address,
+		                          state.write_report_ring, byte_offset64);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		// Most writes land on pages already reported: a load keeps them from all contending for
+		// the same word with read-modify-writes.
+		const auto current = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), current, pointer,
+		                          ConstantU32(state, spv::ScopeDevice),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		const auto missing = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), missing,
+		                          EmitBinaryU32(state, spv::OpBitwiseAnd, current, bit),
+		                          ConstantU32(state, 0u));
+		EmitIfCondition(state, missing, [&]() {
+			state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+			                          pointer, ConstantU32(state, spv::ScopeDevice),
+			                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+		});
+	});
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
@@ -123,6 +198,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB.
 	// Use the actual bound range, including alignment, without truncating guest memory.
 	access.length = state.memory_dword_lengths[array_index];
+	if (state.program.bindings.has_write_reports) {
+		access.write_report = state.write_report_packed[array_index];
+	}
 	return access;
 }
 

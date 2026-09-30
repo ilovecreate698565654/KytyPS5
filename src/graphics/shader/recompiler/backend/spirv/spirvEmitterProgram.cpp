@@ -245,13 +245,33 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
-void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+void EmitDirectInstructionUnchecked(ValueEmitContext& ctx, const IR::Inst& inst) {
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
 #undef VALUE_OPCODE
 		default: ctx.Fail(inst, "has no direct SPIR-V emitter");
+	}
+}
+
+// Write reports are only sound if every guest storage-buffer write reports its page: a write
+// that doesn't would leave its page looking unwritten, and the host would drop the GPU's data.
+void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	const auto access = IR::BufferAccessOf(inst.GetOpcode());
+	if (!ctx.state.program.bindings.has_write_reports ||
+	    (access != IR::BufferAccess::Write && access != IR::BufferAccess::Atomic)) {
+		EmitDirectInstructionUnchecked(ctx, inst);
+		return;
+	}
+	const auto kind   = ctx.Memory(inst).kind;
+	const auto before = ctx.state.write_report_sites;
+	EmitDirectInstructionUnchecked(ctx, inst);
+	if ((kind == IR::ResourceKind::Buffer || kind == IR::ResourceKind::ScalarBuffer) &&
+	    ctx.state.write_report_sites == before) {
+		EXIT("write reports: guest buffer write without a report, hash=0x%016" PRIx64
+		     " opcode=%u\n",
+		     ctx.state.program.shader_hash, static_cast<uint32_t>(inst.GetOpcode()));
 	}
 }
 

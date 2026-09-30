@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -47,6 +48,14 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 }
 
 } // namespace
+
+bool WriteReportsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_REPORTS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
 	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
@@ -117,6 +126,13 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(buffers.size());
+	// Only shaders that may write a storage buffer carry write reports; the others compile to
+	// the same program as with reports off.
+	next.has_write_reports =
+	    WriteReportsEnabled() && std::ranges::any_of(buffers, [&](uint32_t resource) {
+		    const auto& buffer = program.info.buffers[resource];
+		    return buffer.written || buffer.atomic;
+	    });
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

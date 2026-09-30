@@ -463,6 +463,7 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
+	EmitWriteReport(ctx.state, resource, index);
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
 	                            Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
@@ -509,6 +510,7 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
+	EmitWriteReport(ctx.state, resource, index);
 	ctx.state.builder.AddFunction(spv::OpStore,
 	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
 	                              resource.memory_access);
@@ -586,6 +588,7 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
 		return EmitValueOrZeroIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    EmitWriteReport(ctx.state, access.resource, access.index);
 			    return operation(
 			        EmitMemoryElementPointer(ctx.state, access.resource, access.index));
 		    });
@@ -1467,6 +1470,10 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    return EmitValueOrDefaultIfCondition(
 		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
 		        ConstantU64(state, 0), [&]() {
+			        // The report tracks dwords from the start of the bound range.
+			        EmitWriteReport(state, resource,
+			                        Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+			                               byte_address, ConstantU32(state, 2u)));
 			        const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state),
 			                                 ctx.Arg(inst, inst.NumArgs() - 2));
 			        const auto old   = state.builder.AllocateId();

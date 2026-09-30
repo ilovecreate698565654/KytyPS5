@@ -99,6 +99,12 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// Write reports (BindingLayout::has_write_reports): the ring's device address and each bound
+	// buffer's packed report value, loaded at function entry. The counters check that every
+	// guest buffer write site was instrumented.
+	uint32_t                                         write_report_ring = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> write_report_packed {};
+	uint64_t                                         write_report_sites = 0;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -416,9 +422,15 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	bool                  add_index_offset = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Packed write report value of a guest storage buffer (0 when the program has no reports).
+	uint32_t              write_report     = 0;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+
+// Write reports: marks the 4 KiB page of element `index` (a dword index from the start of the
+// bound range) as written. A no-op for resources without a report.
+void EmitWriteReport(EmitterState& state, const MemoryResourceAccess& access, uint32_t index);
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,

@@ -436,11 +436,25 @@ struct DescriptorBinding {
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
+// Research (KYTY_WRITE_REPORTS=1): shaders that write storage buffers set one bit per 4 KiB page
+// they actually wrote, so the host stops treating the rest of a written binding as GPU-dirty.
+// Read once; compiled programs only differ when it is on.
+[[nodiscard]] bool WriteReportsEnabled();
+
+// A write report dword that tells the shader not to report writes to this binding.
+inline constexpr uint32_t WriteReportOff = UINT32_MAX;
+// Packed write report value: ring word base << WriteReportPhaseBits | phase in dwords, where page
+// p of the binding (p = (dword index + phase) >> 10) sets bit p % 32 of ring word base + p / 32.
+inline constexpr uint32_t WriteReportPhaseBits = 10;
+
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	bool                           has_dispatch_dimensions = false;
+	// Write reports: the report ring's device address (2 dwords), then one packed report value
+	// per bound buffer, follow the dispatch dimensions.
+	bool                           has_write_reports = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -451,8 +465,11 @@ struct BindingLayout {
 	[[nodiscard]] uint32_t DispatchDimensionsDword() const {
 		return BufferLengthDword() + memory_offset_count;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t WriteReportDword() const {
 		return DispatchDimensionsDword() + (has_dispatch_dimensions ? 3u : 0u);
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return WriteReportDword() + (has_write_reports ? 2u + memory_offset_count : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

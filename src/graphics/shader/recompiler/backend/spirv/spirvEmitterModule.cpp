@@ -126,7 +126,9 @@ bool DispatchDimensionsIndirect(const EmitterState& state) {
 }
 
 bool UsesPhysicalAddresses(const EmitterState& state) {
-	return state.program.info.uses_dma || DispatchDimensionsIndirect(state);
+	// Write reports set their bits through the report ring's device address.
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state) ||
+	       state.program.bindings.has_write_reports;
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
