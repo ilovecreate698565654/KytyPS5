@@ -38,6 +38,11 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Any thread: waits for a tick that has already been submitted (never the one recording).
+	void                      WaitSubmitted(uint64_t tick) {
+		EXIT_IF(tick >= CurrentTick());
+		m_master.Wait(tick);
+	}
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;

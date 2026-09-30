@@ -443,7 +443,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	// A guest thread's readback used to hold the GPU command thread for the whole wait (65% of it
+	// in Wolverine's forest): it now only records the download and submits, and the faulting
+	// thread waits for that submission by itself. KYTY_SYNC_READBACK=1 restores the old wait.
+	static const bool async_enabled = std::getenv("KYTY_SYNC_READBACK") == nullptr;
+	const bool        async_drain   = async_enabled && !GuestGpu::IsGpuThread();
+	uint64_t          drain_tick    = 0;
+	uint64_t          drain_begin   = 0;
+	uint64_t          drain_end     = 0;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, async_drain,
+	                                                &drain_tick, &drain_begin, &drain_end] {
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory");
 		auto*      stats = ReadbackStats::Enabled() ? &GetReadbackStats() : nullptr;
 		if (stats != nullptr) {
@@ -465,6 +474,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
 		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+			bool downloading = false;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
+			}
+			if (downloading) {
+				// Another readback's download of these bytes has not landed yet: lifting the
+				// protection now would let the guest read the old value.
+				if (async_drain) {
+					drain_tick  = m_scheduler.CurrentTick();
+					drain_begin = page_begin;
+					drain_end   = page_end;
+					m_scheduler.Flush();
+					return;
+				}
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+			}
 			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 			if (is_write) {
 				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -502,6 +530,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+			if (async_drain) {
+				drain_tick  = m_scheduler.CurrentTick();
+				drain_begin = window_begin;
+				drain_end   = window_end;
+				m_scheduler.Flush();
+				return;
+			}
 			// Measured on Wolverine (KYTY_READBACK_STATS): the drains cycle over 4 windows the GPU
 			// re-dirties between reads, so batching only re-downloaded ~30 MB/s for nothing.
 			// Opt-in (KYTY_READBACK_BATCH=1) until write tracking is precise.
@@ -541,6 +576,47 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (drain_tick == 0) {
+		return;
+	}
+	{
+		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory wait");
+		m_scheduler.WaitSubmitted(drain_tick);
+		m_scheduler.WaitPriorityOperations(drain_tick);
+	}
+	m_scheduler.Context().GetGpu().SendCommandSync([this, drain_begin, drain_end, vaddr, size,
+	                                                is_write] {
+		FinishAsyncDrain(drain_begin, drain_end, vaddr, size, is_write);
+	});
+}
+
+void BufferCache::FinishAsyncDrain(uint64_t begin, uint64_t end, uint64_t vaddr, uint64_t size,
+                                   bool is_write) {
+	KYTY_PROFILER_BLOCK("BufferCache::FinishAsyncDrain");
+	// The GPU thread kept recording while the guest thread waited: pages it has marked written
+	// again, or whose bytes another download is still bringing back, stay protected (the guest
+	// faults again and starts a new readback).
+	for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
+	     page < Common::AlignUp(end, TRACKER_PAGE_SIZE); page += TRACKER_PAGE_SIZE) {
+		if (!m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE) ||
+		    HasGpuDirtyBytes(page, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		{
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			if (m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+				continue;
+			}
+		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+	}
+	if (is_write) {
+		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		if (!m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin)) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+	}
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

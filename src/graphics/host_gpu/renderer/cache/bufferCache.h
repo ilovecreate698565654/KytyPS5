@@ -54,6 +54,10 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	// GPU thread, after a guest thread waited out a readback it started: unprotects the pages of
+	// [begin, end) that no longer hold GPU-dirty bytes or pending downloads.
+	void                   FinishAsyncDrain(uint64_t begin, uint64_t end, uint64_t vaddr,
+	                                        uint64_t size, bool is_write);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// Marks a buffer bound through FindBuffer as used, so the collector doesn't evict a buffer
