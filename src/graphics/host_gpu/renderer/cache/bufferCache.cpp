@@ -443,8 +443,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			constexpr uint64_t ExtraBudget = 8 * 1024 * 1024;
-			uint64_t           budget      = ExtraBudget;
+			// Measured on Wolverine (KYTY_READBACK_STATS): the drains cycle over 4 windows the GPU
+			// re-dirties between reads, so batching only re-downloaded ~30 MB/s for nothing.
+			// Opt-in (KYTY_READBACK_BATCH=1) until write tracking is precise.
+			static const bool batch  = std::getenv("KYTY_READBACK_BATCH") != nullptr;
+			const uint64_t    budget_limit = batch ? 8u * 1024u * 1024u : 0u;
+			uint64_t          budget       = budget_limit;
 			std::vector<std::pair<uint64_t, uint64_t>> extra;
 			for (const auto& window: m_hot_windows) {
 				const auto bytes = window.end - window.begin;
