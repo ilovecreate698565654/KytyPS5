@@ -689,14 +689,18 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (has_storage_writes) {
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
-		vk::MemoryBarrier barrier {};
-		barrier.srcAccessMask =
-		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-		vk_buffer.pipelineBarrier(
-		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
-		        vk::PipelineStageFlagBits::eTransfer,
-		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		// Converted group counts are only written by Convert's own dispatch, which already
+		// barriers that write to the indirect read (groups_ready).
+		if (!use_thread_dimensions) {
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask =
+			    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(
+			    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+			        vk::PipelineStageFlagBits::eTransfer,
+			    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
