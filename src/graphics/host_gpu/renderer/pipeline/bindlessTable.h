@@ -129,6 +129,9 @@ public:
 	                       SamplerCache& cache);
 	// Slot 0 of the sampler array, used for keys outside their heap; written once.
 	void WriteDefaultSampler(vk::Sampler sampler);
+	[[nodiscard]] bool DefaultSamplerWritten() const {
+		return m_default_sampler_written || m_set == nullptr;
+	}
 	[[nodiscard]] bool SamplersEnabled() const noexcept { return m_samplers_per_array != 0; }
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.

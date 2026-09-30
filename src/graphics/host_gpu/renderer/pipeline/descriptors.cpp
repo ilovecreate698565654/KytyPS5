@@ -839,15 +839,21 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
-		table.SetTranslation(heap, key, 0u);
+		// The texture is not in memory yet (streaming): stay pending so the key is retried.
+		heap.settled[key] = 0;
 		return false;
 	}
 	BindImage(binding.image_id, false);
 	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
-	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	image = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || view == nullptr) {
+		heap.settled[key] = 0;
+		return false;
+	}
+	// Allocated only once the view exists, so a retried key never leaks slots.
 	const auto slot = table.AllocateSlot(heap.binding);
-	if (image == nullptr || view == nullptr || slot == 0) {
-		table.SetTranslation(heap, key, 0u);
+	if (slot == 0) {
+		heap.settled[key] = 0;
 		return false;
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
@@ -899,7 +905,9 @@ void RenderExecutor::ResolveBindlessRequests() {
 			if (resolved >= Budget) {
 				break; // still pending: the next frame flags it again
 			}
-			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+			// Failed keys that stay pending count too, so retries cannot stall a frame.
+			const bool ok = ResolveBindlessKey(heap, key);
+			resolved += (ok || heap.settled[key] == 0) ? 1u : 0u;
 		}
 	}
 	table.RecordFeedbackSnapshot(scheduler);
@@ -917,7 +925,7 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 	}
 	auto& table = m_context.GetBindlessTable();
 	auto& cache = m_context.GetSamplerCache();
-	{
+	if (!table.DefaultSamplerWritten()) { // written once; skip the sampler lookup afterwards
 		ShaderSamplerResource default_sampler;
 		std::ranges::copy(ShaderRecompiler::IR::BindlessDefaultSampler, default_sampler.fields);
 		table.WriteDefaultSampler(cache.GetSampler(default_sampler, false));
