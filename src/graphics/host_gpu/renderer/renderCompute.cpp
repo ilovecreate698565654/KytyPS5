@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -160,30 +161,59 @@ public:
 		for (const auto& saved: m_saved) {
 			if (saved.gds) {
 				cache.GetGdsBuffer()->CopyFrom(m_context.GetCommandScheduler().Current(),
-				                               *saved.buffer, 0, 0, saved.buffer->Size());
+				                               *saved.buffer, 0, 0, saved.size);
 			} else {
 				// Resolving a fault can merge owners; never retain a native destination
 				// handle or BufferId across CollectFaults().
-				auto [destination, offset] =
-				    cache.ObtainBuffer(saved.address, saved.buffer->Size(), true);
+				auto [destination, offset] = cache.ObtainBuffer(saved.address, saved.size, true);
 				destination->CopyFrom(m_context.GetCommandScheduler().Current(), *saved.buffer, 0,
-				                      offset, saved.buffer->Size());
+				                      offset, saved.size);
 			}
 		}
 		m_context.PrepareBda();
 		return true;
 	}
 
+	// Every attempt loop ends in Retry() -> CollectFaults() -> Finish(), so the snapshot
+	// buffers are idle here and can serve the next protected dispatch.
+	~DispatchBufferRecovery() {
+		auto& pool = SnapshotPool();
+		for (auto& saved: m_saved) {
+			if (pool.size() < MaxPooledSnapshots) {
+				pool.push_back(std::move(saved.buffer));
+			}
+		}
+	}
+
 private:
+	static constexpr size_t MaxPooledSnapshots = 32;
+
+	// GPU thread only.
+	static std::vector<std::unique_ptr<Buffer>>& SnapshotPool() {
+		static std::vector<std::unique_ptr<Buffer>> pool;
+		return pool;
+	}
+
 	void Save(const Buffer& source, uint64_t offset, uint64_t address, uint64_t size, bool gds) {
-		auto saved =
-		    std::make_unique<Buffer>(m_context.GetGraphics(), m_context.GetCommandScheduler(),
-		                             MemoryUsage::DeviceLocal, 0, AllFlags, size);
+		auto& pool = SnapshotPool();
+		const auto fit = std::find_if(pool.begin(), pool.end(), [size](const auto& buffer) {
+			return buffer->Size() >= size && buffer->Size() <= size * 4u;
+		});
+		std::unique_ptr<Buffer> saved;
+		if (fit != pool.end()) {
+			saved = std::move(*fit);
+			pool.erase(fit);
+		} else {
+			saved = std::make_unique<Buffer>(m_context.GetGraphics(), m_context.GetCommandScheduler(),
+			                                 MemoryUsage::DeviceLocal, 0, AllFlags,
+			                                 std::bit_ceil(size));
+		}
 		saved->CopyFrom(m_context.GetCommandScheduler().Current(), source, offset, 0, size);
-		m_saved.push_back({address, gds, std::move(saved)});
+		m_saved.push_back({address, size, gds, std::move(saved)});
 	}
 	struct Saved {
 		uint64_t                address;
+		uint64_t                size;
 		bool                    gds;
 		std::unique_ptr<Buffer> buffer;
 	};
@@ -615,8 +645,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
-	RebindImages(bindings);
-	RebindBuffers(bindings);
+	// The recovery snapshot reads only buffer_sources (from FindBuffers); the loop rebinds after
+	// acquiring the arguments, so binding here first only repeated two uploads per dispatch.
 	DispatchBufferRecovery recovery(m_context, bindings, cs_regs.cs_regs.data_addr);
 	do {
 		RebindImages(bindings);
