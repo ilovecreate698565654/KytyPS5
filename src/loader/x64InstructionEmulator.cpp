@@ -1066,9 +1066,101 @@ bool TryEmulateLoad(void* native_context, uint64_t fault_vaddr, LoadReader read)
 	return true;
 }
 
+bool TryEmulateStore(void* native_context, uint64_t fault_vaddr, StoreWriter write) {
+	auto* context = static_cast<PCONTEXT>(native_context);
+	if (context == nullptr || write == nullptr) {
+		return false;
+	}
+	ZydisDecodedInstruction instruction {};
+	ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
+	if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&LoadDecoder(),
+	                                         reinterpret_cast<const void*>(context->Rip),
+	                                         ZYDIS_MAX_INSTRUCTION_LENGTH, &instruction, operands)) ||
+	    (instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_LEGACY &&
+	     instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX) ||
+	    (instruction.attributes & (ZYDIS_ATTRIB_HAS_LOCK | ZYDIS_ATTRIB_HAS_REP |
+	                               ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE)) != 0 ||
+	    instruction.operand_count_visible != 2 || operands[0].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+		return false;
+	}
+	const auto& mem     = operands[0];
+	const auto& source  = operands[1];
+	uint64_t    address = 0;
+	const auto  bytes   = static_cast<uint64_t>(mem.size) / 8u;
+	if (!EffectiveAddress(context, instruction, mem, address) || bytes == 0 || bytes > 32 ||
+	    fault_vaddr < address || fault_vaddr - address >= bytes) {
+		return false;
+	}
+	alignas(32) uint8_t data[32] {};
+
+	if (instruction.mnemonic == ZYDIS_MNEMONIC_MOV || instruction.mnemonic == ZYDIS_MNEMONIC_MOVNTI) {
+		if (bytes > 8) {
+			return false;
+		}
+		uint64_t value = 0;
+		if (source.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+			if (!ReadGpr(context, source.reg.value, mem.size, value)) {
+				return false; // segment or other non-GPR source
+			}
+		} else if (source.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+			// Sign-extended by the decoder where the encoding sign-extends.
+			value = source.imm.value.u & WidthMask(mem.size);
+		} else {
+			return false;
+		}
+		std::memcpy(data, &value, bytes);
+	} else {
+		switch (instruction.mnemonic) {
+			case ZYDIS_MNEMONIC_MOVNTPS:
+			case ZYDIS_MNEMONIC_MOVNTPD:
+			case ZYDIS_MNEMONIC_MOVNTDQ:
+			case ZYDIS_MNEMONIC_VMOVNTPS:
+			case ZYDIS_MNEMONIC_VMOVNTPD:
+			case ZYDIS_MNEMONIC_VMOVNTDQ: break;
+			default:
+				if (!IsVectorLoad(instruction.mnemonic)) {
+					return false;
+				}
+				break;
+		}
+		if (source.type != ZYDIS_OPERAND_TYPE_REGISTER) {
+			return false;
+		}
+		const auto reg = source.reg.value;
+		const bool ymm = reg >= ZYDIS_REGISTER_YMM0 && reg <= ZYDIS_REGISTER_YMM15;
+		if (!ymm && (reg < ZYDIS_REGISTER_XMM0 || reg > ZYDIS_REGISTER_XMM15)) {
+			return false; // MMX source
+		}
+		const auto index =
+		    static_cast<uint32_t>(reg - (ymm ? ZYDIS_REGISTER_YMM0 : ZYDIS_REGISTER_XMM0));
+		if (bytes > (ymm ? 32u : 16u)) {
+			return false;
+		}
+		std::memcpy(data, &context->Xmm0 + index, sizeof(M128A));
+		if (ymm) {
+			if ((context->ContextFlags & CONTEXT_XSTATE) != CONTEXT_XSTATE) {
+				return false;
+			}
+			// Null when the AVX state is in its initial state: the upper halves are zero.
+			if (const auto* upper = UpperYmm(context); upper != nullptr) {
+				std::memcpy(data + sizeof(M128A), upper + index, sizeof(M128A));
+			}
+		}
+	}
+	if (!write(fault_vaddr, address, data, bytes)) {
+		return false;
+	}
+	context->Rip += instruction.length;
+	return true;
+}
+
 #else
 
 bool TryEmulateLoad(void* /*native_context*/, uint64_t /*fault_vaddr*/, LoadReader /*read*/) {
+	return false;
+}
+
+bool TryEmulateStore(void* /*native_context*/, uint64_t /*fault_vaddr*/, StoreWriter /*write*/) {
 	return false;
 }
 

@@ -14,6 +14,7 @@
 #include <map>
 #include <shared_mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -102,6 +103,9 @@ public:
 	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
 	// no cached buffer covers them); the caller then writes normally.
 	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	// GPU thread: WriteClean for a guest store that faulted. Each page takes a few per frame;
+	// beyond that the caller downloads it once, which unprotects it for bulk writers.
+	[[nodiscard]] bool              WriteStore(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
@@ -160,6 +164,8 @@ private:
 	};
 	static constexpr size_t                            MaxHotWindows = 64;
 	std::vector<HotWindow>                             m_hot_windows;
+	std::unordered_map<uint64_t, uint32_t>             m_store_budget; // page -> stores this frame
+	uint64_t                                           m_store_budget_frame = ~0ull;
 	CommandScheduler&                                  m_scheduler;
 	FaultManager                                       m_fault_manager;
 	Buffer                                             m_gds_buffer;

@@ -897,6 +897,12 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 	       TryReadBacking(vaddr, data, size);
 }
 
+bool TryWriteGpuDirtyFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                                   uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->WriteFaultingStore(fault_vaddr, vaddr, data, size);
+}
+
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

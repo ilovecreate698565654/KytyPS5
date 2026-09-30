@@ -86,6 +86,19 @@ bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
 }
 
+bool RenderContext::WriteFaultingStore(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                                       uint64_t size) noexcept {
+	if (!IsMapped(vaddr, size) || !m_page_manager.IsReadWatched(fault_vaddr) || m_gpu == nullptr ||
+	    m_gpu->IsStopping() || GuestGpu::IsGpuThread() || CommandScheduler::InDeferredOperation()) {
+		return false;
+	}
+	bool written = false;
+	m_gpu->SendCommandSync([this, vaddr, data, size, &written] {
+		written = m_buffer_cache.WriteStore(vaddr, data, size);
+	});
+	return written;
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;

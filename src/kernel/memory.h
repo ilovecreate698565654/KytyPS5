@@ -118,6 +118,10 @@ bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
+// A store to a page protected because the GPU wrote to it: writes the bytes to guest memory and to
+// the GPU's copy without downloading the page. False when that can't be done safely.
+bool TryWriteGpuDirtyFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+                                   uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 // Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.

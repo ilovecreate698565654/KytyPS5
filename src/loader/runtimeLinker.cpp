@@ -685,6 +685,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
 			return true;
 		}
+		// A plain store into a page protected because the GPU wrote to it: write the bytes to
+		// guest memory and to the GPU's copy instead of downloading the page (a full GPU drain,
+		// most of the readbacks in Wolverine). KYTY_NO_STORE_EMULATION=1 restores the download.
+		static const bool emulate_stores = std::getenv("KYTY_NO_STORE_EMULATION") == nullptr;
+		if (access == GpuAccess::Write && emulate_stores &&
+		    Loader::X64InstructionEmulator::TryEmulateStore(
+		        info->native_context, info->access_violation_vaddr,
+		        &Libs::LibKernel::Memory::TryWriteGpuDirtyFaultingBytes)) {
+			return true;
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			return true;
 		}

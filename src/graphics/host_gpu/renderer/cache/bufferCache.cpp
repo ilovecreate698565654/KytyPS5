@@ -334,6 +334,7 @@ namespace {
 // an earlier drain's batch, and the most frequent windows. GPU thread only.
 struct ReadbackStats {
 	uint64_t                                calls        = 0;
+	uint64_t                                stores       = 0;
 	uint64_t                                writes       = 0;
 	uint64_t                                fast_path    = 0;
 	uint64_t                                drains       = 0;
@@ -357,9 +358,9 @@ struct ReadbackStats {
 		std::sort(top.begin(), top.end(),
 		          [](const auto& a, const auto& b) { return a.second > b.second; });
 		std::string text = fmt::format(
-		    "Readback stats (2 s): calls={} writes={} fast={} drains={} distinct_windows={} "
-		    "already_batched={} extra_downloads={} ({} KiB)\n",
-		    calls, writes, fast_path, drains, windows.size(), was_hot, extras, extra_bytes / 1024u);
+		    "Readback stats (2 s): calls={} writes={} merged_stores={} fast={} drains={} "
+		    "distinct_windows={} already_batched={} extra_downloads={} ({} KiB)\n",
+		    calls, writes, stores, fast_path, drains, windows.size(), was_hot, extras, extra_bytes / 1024u);
 		for (size_t i = 0; i < std::min<size_t>(top.size(), 8u); i++) {
 			text += fmt::format("  window 0x{:012x} x{}\n", top[i].first, top[i].second);
 		}
@@ -377,6 +378,27 @@ ReadbackStats& GetReadbackStats() {
 }
 
 } // namespace
+
+bool BufferCache::WriteStore(uint64_t vaddr, const void* data, uint64_t size) {
+	constexpr uint32_t StoresPerPagePerFrame = 16;
+	const auto         frame =
+	    m_scheduler.Context().GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	if (frame != m_store_budget_frame) {
+		m_store_budget.clear();
+		m_store_budget_frame = frame;
+	}
+	auto& used = m_store_budget[vaddr / TRACKER_PAGE_SIZE];
+	if (used >= StoresPerPagePerFrame || !WriteClean(vaddr, data, size)) {
+		return false;
+	}
+	used++;
+	if (ReadbackStats::Enabled()) {
+		auto& stats = GetReadbackStats();
+		stats.stores++;
+		stats.Report();
+	}
+	return true;
+}
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {

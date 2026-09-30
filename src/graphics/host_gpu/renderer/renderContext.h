@@ -55,6 +55,10 @@ public:
 	// but none of them is GPU-written, so guest memory already holds their value.
 	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
 	                                     uint64_t size) const noexcept;
+	// Any guest thread: a plain store faulted on a page protected because the GPU wrote to it.
+	// Merges the bytes into both copies on the GPU thread; false to take the download path.
+	[[nodiscard]] bool WriteFaultingStore(uint64_t fault_vaddr, uint64_t vaddr, const void* data,
+	                                      uint64_t size) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
