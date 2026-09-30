@@ -17,6 +17,9 @@ public:
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
+		if (it != m_ranges.end() && it->first <= address && it->second >= end) {
+			return; // Already covered: erasing and re-inserting would recreate the same node.
+		}
 		uint64_t begin = address;
 		uint64_t last  = end;
 		while (it != m_ranges.end() && it->first <= last) {
