@@ -1214,7 +1214,9 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
 	PRINT_NAME();
 
-	if (convert == nullptr || convert->src_dir_name == nullptr) {
+	if (convert == nullptr || convert->src_dir_name == nullptr ||
+	    !valid_path_component(convert->src_dir_name->data) ||
+	    (convert->dst_dir_name != nullptr && !valid_path_component(convert->dst_dir_name->data))) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 	const auto* dst = convert->dst_dir_name != nullptr ? convert->dst_dir_name : convert->src_dir_name;
