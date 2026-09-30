@@ -248,11 +248,17 @@ private:
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
 };
 
+struct TrackingFailure {
+	std::string message;
+};
+
 class Tracker {
 public:
-	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg)
+	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
+	        bool recoverable = false)
 	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
-	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
+	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info),
+	      m_recoverable(recoverable) {
 		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
 		m_info.images.clear();
@@ -335,6 +341,9 @@ private:
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (m_recoverable) {
+			throw TrackingFailure {message};
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -1790,6 +1799,7 @@ private:
 	std::vector<const Inst*>                   m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
+	bool                                       m_recoverable = false;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
@@ -1802,6 +1812,16 @@ private:
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
 	Tracker(program, decoded, native_cfg).Run();
+}
+
+std::optional<std::string> TryTrackResources(Program& program, const Decoder::Program& decoded,
+                                             const CFG::Graph& native_cfg) {
+	try {
+		Tracker(program, decoded, native_cfg, true).Run();
+	} catch (const TrackingFailure& failure) {
+		return failure.message;
+	}
+	return std::nullopt;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

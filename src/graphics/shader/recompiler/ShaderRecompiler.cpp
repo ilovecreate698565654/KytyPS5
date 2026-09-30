@@ -631,7 +631,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	if (options.stage == ShaderType::Compute && options.skip_untracked_compute) {
+		if (const auto failure = IR::TryTrackResources(ir, decoded, native_cfg)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: skipping compute dispatches of shader 0x{:016x}: {}\n", options.shader_hash,
+			    *failure));
+			return {.skip_dispatch = true};
+		}
+	} else {
+		IR::TrackResources(ir, decoded, native_cfg);
+	}
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
