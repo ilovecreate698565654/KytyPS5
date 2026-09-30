@@ -248,10 +248,6 @@ private:
 	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
 };
 
-struct TrackingFailure {
-	std::string message;
-};
-
 class Tracker {
 public:
 	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
@@ -280,6 +276,9 @@ public:
 				Collect(inst);
 			}
 		}
+		if (m_failure) {
+			return;
+		}
 		LinkImageAliases();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
@@ -307,6 +306,8 @@ public:
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
 	}
+
+	[[nodiscard]] const std::optional<std::string>& Failure() const { return m_failure; }
 
 private:
 	struct HandlePatch {
@@ -337,15 +338,27 @@ private:
 		std::array<const Inst*, 8> reads {};
 	};
 
+	[[nodiscard]] std::string FailureMessage(uint32_t pc, const std::string& reason) const {
+		return fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
+		                   m_program.shader_hash, StageName(m_program.stage), pc, reason);
+	}
+
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
-		const auto message =
-		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
-		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
-		if (m_recoverable) {
-			throw TrackingFailure {message};
-		}
+		const auto message = FailureMessage(pc, reason);
 		EXIT("%s", message.c_str());
 		std::abort();
+	}
+
+	// A descriptor that can't be resolved statically. Recoverable tracking records the first one
+	// and stops collecting so the caller can skip the shader; otherwise this exits like Fail.
+	bool Unresolved(uint32_t pc, const std::string& reason) {
+		if (!m_recoverable) {
+			Fail(pc, reason);
+		}
+		if (!m_failure) {
+			m_failure = FailureMessage(pc, reason);
+		}
+		return true;
 	}
 
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
@@ -1506,8 +1519,10 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			if (Unresolved(pc, fmt::format("{} dword {} is not a valid runtime value",
+			                               ValueOpcodeName(expected), bad_dword))) {
+				return false;
+			}
 		}
 		source = InternSource(descriptor);
 		return true;
@@ -1657,6 +1672,9 @@ private:
 	}
 
 	void Collect(Inst& inst) {
+		if (m_failure) {
+			return;
+		}
 		const auto op           = inst.GetOpcode();
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
@@ -1683,10 +1701,15 @@ private:
 		if (buffer != BufferAccess::None) {
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
+				if (m_failure) {
+					return;
+				}
 				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
-					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x3/x4 load");
+					if (Unresolved(flags.pc,
+					               "buffer descriptor is not a valid runtime value; GPU-selected "
+					               "access requires a raw DWORD x2/x3/x4 load")) {
+						return;
+					}
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
@@ -1731,9 +1754,9 @@ private:
 		const auto* indirect = handle != nullptr ? FindIndirectImage(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
-		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
-			          memory.resource * 4u, handle, source);
+		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
+		                      memory.resource * 4u, handle, source)) {
+			return;
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
@@ -1749,8 +1772,11 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-			          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			               memory.sampler * 4u, sampler_handle, sampler_source, true,
+			               sample_adjust)) {
+				return;
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -1800,6 +1826,7 @@ private:
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	bool                                       m_recoverable = false;
+	std::optional<std::string>                 m_failure;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
@@ -1816,12 +1843,9 @@ void TrackResources(Program& program, const Decoder::Program& decoded, const CFG
 
 std::optional<std::string> TryTrackResources(Program& program, const Decoder::Program& decoded,
                                              const CFG::Graph& native_cfg) {
-	try {
-		Tracker(program, decoded, native_cfg, true).Run();
-	} catch (const TrackingFailure& failure) {
-		return failure.message;
-	}
-	return std::nullopt;
+	Tracker tracker(program, decoded, native_cfg, true);
+	tracker.Run();
+	return tracker.Failure();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
