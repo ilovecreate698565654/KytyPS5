@@ -359,38 +359,10 @@ bool CondVar::WaitFor(Mutex* mutex, uint32_t micros) {
 	std::unique_lock<std::recursive_mutex> cpp_lock(mutex->m_mutex->m_mutex, std::adopt_lock_t());
 #endif
 #ifdef KYTY_WIN_CS
-	if (micros < 1000) {
-		// SleepConditionVariableCS only takes milliseconds, so a 100 us guest poll (equeue waits,
-		// the GPU thread's idle recheck) slept 1-2 ms: 10-20x the request. Yield until signaled
-		// or the deadline passes; every caller re-checks its condition after the wait returns.
-		const auto    generation = m_cond_var->m_generation.load(std::memory_order_acquire);
-		LARGE_INTEGER frequency {};
-		LARGE_INTEGER start {};
-		LARGE_INTEGER now {};
-		QueryPerformanceFrequency(&frequency);
-		QueryPerformanceCounter(&start);
-		const auto ticks = static_cast<LONGLONG>(micros) * frequency.QuadPart / 1000000;
-		LeaveCriticalSection(&mutex->m_mutex->m_cs);
-		bool signaled = false;
-		for (;;) {
-			if (m_cond_var->m_generation.load(std::memory_order_acquire) != generation) {
-				signaled = true;
-				break;
-			}
-			QueryPerformanceCounter(&now);
-			if (now.QuadPart - start.QuadPart >= ticks) {
-				break;
-			}
-			if (SwitchToThread() == 0) {
-				YieldProcessor();
-			}
-		}
-		EnterCriticalSection(&mutex->m_mutex->m_cs);
-		return signaled;
-	}
 	static auto func = ResolveSleepConditionVariableCS();
 	EXIT_NOT_IMPLEMENTED(func == nullptr);
-	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs, micros / 1000) == 0 &&
+	ok = !(func(&m_cond_var->m_cv, &mutex->m_mutex->m_cs,
+	                (micros < 1000 ? 1 : micros / 1000)) == 0 &&
 	       GetLastError() == ERROR_TIMEOUT);
 #else
 	ok = (m_cond_var->m_cv.wait_for(cpp_lock, std::chrono::microseconds(micros)) ==

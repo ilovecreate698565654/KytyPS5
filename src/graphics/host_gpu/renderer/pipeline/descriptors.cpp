@@ -839,21 +839,20 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	auto& texture_cache = m_context.GetTextureCache();
 	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || image->info.data.Empty()) {
-		// The texture is not in memory yet (streaming): stay pending so the key is retried.
-		heap.settled[key] = 0;
+		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	BindImage(binding.image_id, false);
 	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
 	image = texture_cache.m_slot_images.try_get(binding.image_id);
 	if (image == nullptr || view == nullptr) {
-		heap.settled[key] = 0;
+		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	// Allocated only once the view exists, so a retried key never leaks slots.
 	const auto slot = table.AllocateSlot(heap.binding);
 	if (slot == 0) {
-		heap.settled[key] = 0;
+		table.SetTranslation(heap, key, 0u);
 		return false;
 	}
 	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
@@ -905,9 +904,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 			if (resolved >= Budget) {
 				break; // still pending: the next frame flags it again
 			}
-			// Failed keys that stay pending count too, so retries cannot stall a frame.
-			const bool ok = ResolveBindlessKey(heap, key);
-			resolved += (ok || heap.settled[key] == 0) ? 1u : 0u;
+			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
 		}
 	}
 	table.RecordFeedbackSnapshot(scheduler);
